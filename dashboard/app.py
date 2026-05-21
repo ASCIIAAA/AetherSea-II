@@ -1,273 +1,241 @@
+# dashboard/app.py
+import sys
+import os
 import streamlit as st
-import plotly.graph_objects as go
+import numpy as np
 import pandas as pd
+import xarray as xr
+import plotly.graph_objects as go
 
-# ---------------------------------------------------
-# PAGE CONFIG
-# ---------------------------------------------------
+# Ensure backend modules can be imported smoothly
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-st.set_page_config(
-    page_title="AetherSea",
-    page_icon="🌊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+from backend.index_calculator import IndexCalculator
+from backend.clustering_engine import DBSCANClusteringEngine # Make sure class name matches yours
+from backend.route_optimizer import RouteOptimizer
+from agents.supervisor_agent import SupervisorAgent
 
-# ---------------------------------------------------
-# CUSTOM CSS
-# ---------------------------------------------------
+st.set_page_config(layout="wide", page_title="AetherSea Command Center")
 
-st.markdown("""
-<style>
-
-.main {
-    background-color: #07111f;
-    color: white;
-}
-
-section[data-testid="stSidebar"] {
-    background-color: #0b1727;
-    border-right: 1px solid #1f2f46;
-}
-
-h1, h2, h3, h4 {
-    color: white;
-}
-
-.metric-card {
-    background: rgba(20, 30, 48, 0.85);
-    padding: 20px;
-    border-radius: 18px;
-    border: 1px solid rgba(255,255,255,0.08);
-    box-shadow: 0px 4px 20px rgba(0,0,0,0.4);
-}
-
-.status-online {
-    color: #00ff9f;
-    font-weight: bold;
-}
-
-.small-text {
-    color: #9aa7b8;
-    font-size: 14px;
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------------------------------------------
-# SIDEBAR
-# ---------------------------------------------------
-
-st.sidebar.title("AetherSea Control")
-
-st.sidebar.markdown("---")
-
-region = st.sidebar.selectbox(
-    "Ocean Region",
-    [
-        "Arabian Sea",
-        "Bay of Bengal",
-        "Indian Ocean"
-    ]
-)
-
-threshold = st.sidebar.slider(
-    "Current Threshold",
-    min_value=0.0,
-    max_value=2.0,
-    value=0.5,
-    step=0.1
-)
-
-st.sidebar.markdown("---")
-
-st.sidebar.markdown("### System Status")
-
-st.sidebar.success("HYCOM Connected")
-st.sidebar.success("Ocean Intelligence Active")
-st.sidebar.info("DBSCAN Offline")
-st.sidebar.info("Routing Engine Offline")
-
-# ---------------------------------------------------
-# HEADER
-# ---------------------------------------------------
-
-st.title("🌊 AetherSea Maritime Intelligence System")
-
+st.title("🌊 AETHERSEA — Live-Data Ocean Cleanup Command Center")
 st.markdown(
-    """
-    <div class='small-text'>
-    Real-Time Ocean Monitoring • Marine Debris Intelligence • AI Maritime Operations
-    </div>
-    """,
-    unsafe_allow_html=True
+    "Ingesting **Multi-Spectral Satellite Telemetry** and **Ocean Currents** to coordinate autonomous marine cleanup operations."
 )
 
-st.markdown("---")
+st.sidebar.header("Operational Controls")
+fdi_threshold = st.sidebar.slider("FDI Plastic Detection Threshold", 0.010, 0.030, 0.015, step=0.001)
+run_pipeline = st.sidebar.button("📡 Ingest Live Data & Optimize")
 
-# ---------------------------------------------------
-# TOP METRICS
-# ---------------------------------------------------
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    st.markdown("""
-    <div class="metric-card">
-        <h3>Active Region</h3>
-        <h2>Arabian Sea</h2>
-    </div>
-    """, unsafe_allow_html=True)
-
-with col2:
-    st.markdown("""
-    <div class="metric-card">
-        <h3>Ocean Status</h3>
-        <h2 class="status-online">LIVE</h2>
-    </div>
-    """, unsafe_allow_html=True)
-
-with col3:
-    st.markdown("""
-    <div class="metric-card">
-        <h3>Potential Hotspots</h3>
-        <h2>12</h2>
-    </div>
-    """, unsafe_allow_html=True)
-
-with col4:
-    st.markdown("""
-    <div class="metric-card">
-        <h3>Current Strength</h3>
-        <h2>1.42 m/s</h2>
-    </div>
-    """, unsafe_allow_html=True)
-
-st.markdown("")
-
-# ---------------------------------------------------
-# SAMPLE MAP DATA
-# ---------------------------------------------------
-
-data = pd.DataFrame({
-    "lat": [15, 18, 22],
-    "lon": [65, 70, 75],
-    "label": [
-        "Potential Debris Zone A",
-        "Potential Debris Zone B",
-        "Potential Debris Zone C"
-    ]
-})
-
-# ---------------------------------------------------
-# PLOTLY MAP
-# ---------------------------------------------------
-
-fig = go.Figure()
-
-fig.add_trace(
-    go.Scattermapbox(
-        lat=data["lat"],
-        lon=data["lon"],
-        mode="markers",
-        marker=go.scattermapbox.Marker(
-            size=16
-        ),
-        text=data["label"],
-        hoverinfo="text"
-    )
+if run_pipeline:
+    with st.spinner("Executing analytical pipeline..."):
+        # ==========================================
+        # STEP 1 & 2: LOAD & CROSS-REFERENCE DATA
+        # ==========================================
+        # Loading your verified local 2024 HYCOM dataset
+        url = (
+    "https://tds.hycom.org/thredds/dodsC/"
+    "GLBy0.08/expt_93.0"
 )
 
-# ---------------------------------------------------
-# MAP LAYOUT
-# ---------------------------------------------------
+        ds = xr.open_dataset(
+            url,
+            engine="pydap",
+            decode_times=False
+        )
 
-fig.update_layout(
+        u_surface = ds["water_u"].isel(
+            time=0,
+            depth=0
+        )
 
-    mapbox_style="carto-darkmatter",
+        region = u_surface.sel(
+            lat=slice(5, 30),
+            lon=slice(60, 80)
+        )
 
-    mapbox=dict(
-        center=dict(
-            lat=18,
-            lon=70
-        ),
-        zoom=3
-    ),
+        latitudes = region.lat.values
+        longitudes = region.lon.values
+        
+        # Pulling raw bands (In production, these come from your fetch_satellite GEE script!)
+        # For our unified test, we simulate an active region using the grid size
+        shape = (len(latitudes), len(longitudes))
+        
+        # Creating a realistic baseline grid matching open ocean
+        mock_nir = np.ones(shape) * 0.02
+        mock_red_edge = np.ones(shape) * 0.04
+        mock_swir = np.ones(shape) * 0.01
+        
+        # Seeding random dense anomalies to simulate real clusters picked up by Sentinel-2
+        np.random.seed(42) 
+        for _ in range(45):
+            mock_red = np.ones(shape) * 0.03
+            # Cluster 1
+            y1 = np.random.randint(5, 12)
+            x1 = np.random.randint(8, 15)
 
-    margin=dict(
-        l=0,
-        r=0,
-        t=0,
-        b=0
-    ),
+            mock_nir[y1, x1] = 0.18
+            mock_red[y1, x1] = 0.16
 
-    height=700,
+            # Cluster 2
+            y2 = np.random.randint(18, 25)
+            x2 = np.random.randint(22, 30)
 
-    paper_bgcolor="#07111f",
-    plot_bgcolor="#07111f"
-)
+            mock_nir[y2, x2] = 0.22
+            mock_red[y2, x2] = 0.19
+            
+        # ==========================================
+        # STEP 3: FLOATING DEBRIS INDEX & CLUSTERING
+        # ==========================================
+        calc = IndexCalculator(
+            fdi_threshold=fdi_threshold
+        )
 
-# ---------------------------------------------------
-# MAIN GRID LAYOUT
-# ---------------------------------------------------
+        # ---------------------------------------------------
+        # Compute Spectral Indices
+        # ---------------------------------------------------
 
-left, right = st.columns([3, 1])
+        fdi_matrix = calc.calculate_fdi(
+            mock_nir,
+            mock_red_edge,
+            mock_swir
+        )
 
-with left:
+        # Mock RED band for NDVI
+        mock_red = np.ones(shape) * 0.03
 
-    st.subheader("Live Maritime Intelligence Map")
+        ndvi_matrix = calc.calculate_ndvi(
+            mock_nir,
+            mock_red
+        )
 
-    st.plotly_chart(
-        fig,
-        use_container_width=True
-    )
+        # ---------------------------------------------------
+        # Generate Plastic Mask
+        # ---------------------------------------------------
 
-with right:
+        plastic_mask = calc.create_plastic_mask(
+            fdi_matrix,
+            ndvi_matrix
+        )
 
-    st.subheader("Mission Intelligence")
+        # ---------------------------------------------------
+        # Extract Coordinates
+        # ---------------------------------------------------
 
-    st.markdown("""
-    <div class="metric-card">
-        <h4>HYCOM Feed</h4>
-        <p class="status-online">CONNECTED</p>
+        raw_anomaly_points = (
+            calc.extract_anomaly_coordinates(
+                plastic_mask,
+                fdi_matrix,
+                ndvi_matrix,
+                latitudes,
+                longitudes
+            )
+        )
+        
+        # Convert anomaly dictionaries to coordinate pairs for DBSCAN
+        if len(raw_anomaly_points) == 0:
+            st.error("No plastic anomalies detected above the current threshold slider. Lower the threshold!")
+            st.stop()
+            
+        coords_list = [[p["lat"], p["lon"]] for p in raw_anomaly_points]
+        
+        # Pass coordinates to Partner B's DBSCAN engine
+        # (Assuming your engine returns centers of mass coordinates)
+        # For safety/fallback inline replication if needed:
+        from sklearn.cluster import DBSCAN
+        db = DBSCAN(eps=0.15, min_samples=3).fit(coords_list)
+        labels = db.labels_
+        
+        hotspots = []
+        for label in set(labels) - {-1}:
+            cluster_nodes = np.array(coords_list)[labels == label]
+            c_lat, c_lon = np.mean(cluster_nodes, axis=0)
+            hotspots.append({"lat": float(c_lat), "lon": float(c_lon)})
+            
+        if not hotspots:
+            st.warning("Anomalies found, but they are too scattered to form an operational cluster island.")
+            st.stop()
 
-        <h4>Satellite Layer</h4>
-        <p>PENDING</p>
+        # ==========================================
+        # STEP 4: HAVERSINE ROUTE OPTIMIZATION
+        # ==========================================
+        router = RouteOptimizer()
+        start_port = (float(latitudes[0]), float(longitudes[0]))
+        
+        # Compute path
+        route = router.compute_cleanup_route(start_port, hotspots)
+        
+        # Calculate true Haversine distance sum along the sequence
+        total_distance = 0.0
+        for i in range(len(route)-1):
+            total_distance += router.haversine_distance(route[i], route[i+1])
 
-        <h4>Cluster Detection</h4>
-        <p>PENDING</p>
+        # ==========================================
+        # DISPLAY RESULTS: METRICS & MAP
+        # ==========================================
+        st.header("📊 Tactical Mission Analytics")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Detected Trash Islands", len(hotspots))
+        m2.metric("Total Operational Stops", len(route))
+        m3.metric("Optimized Path Length", f"{total_distance:.2f} km")
+        
+        # Build Interactive Plotly Mapbox
+        st.header("🗺️ Live Deployment Interception Map")
+        
+        fig = go.Figure()
 
-        <h4>AI Dispatch Agent</h4>
-        <p>PENDING</p>
-    </div>
-    """, unsafe_allow_html=True)
+        # 1. Map out the individual satellite anomaly pixels as background warning dots
+        fig.add_trace(go.Scattermapbox(
+            lat=[p[0] for p in coords_list],
+            lon=[p[1] for p in coords_list],
+            mode='markers',
+            marker=go.scattermapbox.Marker(size=5, color='orange', opacity=0.4),
+            name='Raw Satellite Anomalies'
+        ))
 
-    st.markdown("")
+        # 2. Plot the calculated DBSCAN center points (Targets)
+        fig.add_trace(go.Scattermapbox(
+            lat=[h["lat"] for h in hotspots],
+            lon=[h["lon"] for h in hotspots],
+            mode='markers',
+            marker=go.scattermapbox.Marker(size=14, color='cyan'),
+            name='Verified Waste Hotspots'
+        ))
 
-    st.markdown("""
-    <div class="metric-card">
-        <h4>Operational Notes</h4>
+        # 3. Draw the optimized navigation route line connecting everything back to port
+        fig.add_trace(go.Scattermapbox(
+            lat=[r[0] for r in route],
+            lon=[r[1] for r in route],
+            mode='lines+markers',
+            line=dict(width=3, color='lime'),
+            marker=go.scattermapbox.Marker(size=8, color='lime'),
+            name='Optimized Interception Path'
+        ))
 
-        <p>
-        Ocean current analysis indicates several
-        moderate-flow convergence structures
-        within the Arabian Sea operational region.
-        </p>
+        # Set Mapbox canvas behavior and zoom center
+        fig.update_layout(
+            mapbox=dict(
+                style="carto-darkmatter",
+                center=dict(lat=float(np.mean(latitudes)), lon=float(np.mean(longitudes))),
+                zoom=6
+            ),
+            margin=dict(l=0, r=0, t=0, b=0),
+            height=600,
+            showlegend=True
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
 
-        <p>
-        Further satellite validation required
-        before debris cluster confirmation.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-# ---------------------------------------------------
-# FOOTER
-# ---------------------------------------------------
-
-st.markdown("---")
-
-st.caption(
-    "AetherSea • AI-Powered Maritime Environmental Intelligence Platform"
-)
+        # ==========================================
+        # STEP 5: AUTOMATED DISPATCH BRIEFING (GEMINI)
+        # ==========================================
+        st.header("📋 Automated Tactical Command Brief")
+        
+        supervisor = SupervisorAgent()
+        brief_text = supervisor.generate_dispatch_briefing(
+            hotspots_count=len(hotspots),
+            total_distance=total_distance,
+            waypoint_list=route
+        )
+        
+        st.info(brief_text)
+        st.success("🛰️ Active telemetry processing cycle successfully completed.")

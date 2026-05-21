@@ -2,100 +2,79 @@ import numpy as np
 
 from sklearn.cluster import DBSCAN
 
-# ---------------------------------------------------
-# MOCK HIGH-FDI COORDINATES
-# ---------------------------------------------------
 
-# Simulated suspicious debris points
-# Format:
-# [latitude, longitude]
+class DBSCANClusteringEngine:
 
-coordinates = np.array([
+    def __init__(
+        self,
+        eps=0.15,
+        min_samples=3
+    ):
+        """
+        eps:
+            Maximum neighborhood distance.
 
-    [18.10, 70.20],
-    [18.11, 70.19],
-    [18.12, 70.21],
-    [18.13, 70.20],
+        min_samples:
+            Minimum nearby points
+            needed to form a cluster.
+        """
 
-    [22.40, 72.50],
-    [22.41, 72.49],
-    [22.39, 72.51],
-    [22.42, 72.50],
+        self.eps = eps
+        self.min_samples = min_samples
 
-    [15.00, 65.00]  # Noise point
+    # ---------------------------------------------------
+    # Main Clustering Method
+    # ---------------------------------------------------
 
-])
+    def cluster_coordinates(
+        self,
+        coordinates
+    ):
+        """
+        coordinates:
+            List of [lat, lon] points
+        """
 
-print("\nInput Coordinate Points:")
-print(coordinates)
+        if len(coordinates) == 0:
+            return []
 
-# ---------------------------------------------------
-# RUN DBSCAN CLUSTERING
-# ---------------------------------------------------
+        coordinates = np.array(coordinates)
 
-db = DBSCAN(
-    eps=0.02,
-    min_samples=3
-).fit(coordinates)
+        db = DBSCAN(
+            eps=self.eps,
+            min_samples=self.min_samples
+        ).fit(coordinates)
 
-# ---------------------------------------------------
-# CLUSTER LABELS
-# ---------------------------------------------------
+        labels = db.labels_
 
-labels = db.labels_
+        unique_clusters = set(labels)
 
-print("\nCluster Labels:")
-print(labels)
+        # Remove noise label
+        unique_clusters.discard(-1)
 
-# ---------------------------------------------------
-# UNIQUE CLUSTERS
-# ---------------------------------------------------
+        cluster_results = []
 
-unique_clusters = set(labels)
+        for cluster_id in unique_clusters:
 
-# Remove noise label (-1)
+            cluster_points = coordinates[
+                labels == cluster_id
+            ]
 
-if -1 in unique_clusters:
-    unique_clusters.remove(-1)
+            center_lat, center_lon = np.mean(
+                cluster_points,
+                axis=0
+            )
 
-print("\nValid Clusters:")
-print(unique_clusters)
+            cluster_results.append({
 
-# ---------------------------------------------------
-# COMPUTE CLUSTER CENTERS
-# ---------------------------------------------------
+                "cluster_id": int(cluster_id),
 
-cluster_results = []
+                "lat": float(center_lat),
 
-for cluster_id in unique_clusters:
+                "lon": float(center_lon),
 
-    cluster_points = coordinates[
-        labels == cluster_id
-    ]
+                "points_in_cluster": len(cluster_points)
 
-    center_lat, center_lon = np.mean(
-        cluster_points,
-        axis=0
-    )
+            })
 
-    cluster_results.append({
-
-        "cluster_id": int(cluster_id),
-
-        "center_lat": float(center_lat),
-
-        "center_lon": float(center_lon),
-
-        "points_in_cluster": len(cluster_points)
-
-    })
-
-# ---------------------------------------------------
-# FINAL HOTSPOT OUTPUT
-# ---------------------------------------------------
-
-print("\nDetected Marine Debris Hotspots:\n")
-
-for cluster in cluster_results:
-
-    print(cluster)
+        return cluster_results
