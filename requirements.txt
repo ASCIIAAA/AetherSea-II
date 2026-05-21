@@ -89,3 +89,7 @@ uvicorn==0.47.0
 watchdog==6.0.0
 websockets==16.0
 xarray==2026.4.0
+arthengine-api 
+folium 
+streamlit-folium 
+netCDF4
