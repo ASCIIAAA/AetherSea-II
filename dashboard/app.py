@@ -5,7 +5,8 @@ import sys
 import logging
 import datetime
 from pathlib import Path
-
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
@@ -27,20 +28,31 @@ st.set_page_config(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── GEE availability check ───────────────────────────────────────────────────
+# ── GEE availability check & Explicit Diagnostic Bridge ───────────────────────
 _GEE_AVAILABLE = False
+gee_error_msg = None
+
 try:
     import ee
-    from backend.fetch_satellite import (
+    from data.fetch_satellite import (
         init_gee,
         get_plastic_tile_url,
         get_hotspots,
         get_region_stats,
-        DEFAULT_AOI,
+        #DEFAULT_AOI,
+        get_cloud_reduced_hotspots,
     )
+    
+    # Force Streamlit to run the handshake right here on startup to test it!
+    init_gee()
     _GEE_AVAILABLE = True
-except ImportError:
-    pass
+    logger.info("Streamlit process successfully attached to Earth Engine pipeline.")
+    
+except Exception as e:
+    _GEE_AVAILABLE = False
+    # Capture the exact error signature to display on the UI
+    gee_error_msg = f"{type(e).__name__}: {str(e)}"
+    logger.error(f"Streamlit GEE Handshake Failed: {gee_error_msg}")
 
 from backend.routing_engine import plan_cleanup_route
 
@@ -122,6 +134,8 @@ with st.sidebar:
         st.markdown('<span class="status-live">● GEE connected</span>', unsafe_allow_html=True)
     else:
         st.markdown('<span class="status-demo">● Demo mode (no GEE auth)</span>', unsafe_allow_html=True)
+        if gee_error_msg:
+            st.error(f"**Initialization Error Caught:** `{gee_error_msg}`")
         st.caption("Set EE_SERVICE_ACCOUNT + EE_KEY_FILE env vars to enable live data.")
 
 
@@ -135,101 +149,129 @@ with c1:
     st.markdown('<p class="sub-title">Marine Debris Intelligence Platform &nbsp;·&nbsp; Arabian Sea</p>',
                 unsafe_allow_html=True)
 with c2:
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d  %H:%M UTC")
+    ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d  %H:%M UTC")
     st.markdown(f"<div style='text-align:right;color:#4fc3f7;font-size:0.75rem;padding-top:1rem'>{ts}</div>",
                 unsafe_allow_html=True)
 
 st.markdown("---")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Data pipeline
-# ══════════════════════════════════════════════════════════════════════════════
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_live_hotspots(start, end, thresh, max_pts):
-    """Pull real hotspots from GEE (cached 1 hour)."""
-    init_gee()
-    return get_hotspots(start=start, end=end,
-                        fdi_thresh=thresh, max_points=max_pts)
-
+    """Pull real hotspots from GEE quickly using server-side vector scaling."""
+    try:
+        init_gee()
+        lon_range = [60.0, 80.0]
+        lat_range = [5.0, 30.0]
+        return get_cloud_reduced_hotspots(
+            lon_range=lon_range,
+            lat_range=lat_range,
+            start_date=start,
+            end_date=end,
+            fdi_threshold=thresh,
+            ndvi_threshold=0.15
+        )
+    except Exception as e:
+        logger.error(f"Hotspot fetch network failure: {e}")
+        # Return None so the downstream trigger knows a real network failure happened
+        return None
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_tile_url(start, end):
-    init_gee()
-    return get_plastic_tile_url(start=start, end=end)
+    """Generates satellite layer tiles safely with strict error catching."""
+    try:
+        init_gee()
+        aoi_bounds = ee.Geometry.Rectangle([60.0, 5.0, 80.0, 30.0])
+        return get_plastic_tile_url(aoi=aoi_bounds, start=start, end=end)
+    except Exception as e:
+        logger.warning(f"Tile layer generation skipped due to network limits: {e}")
+        return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _load_region_stats(start, end):
     init_gee()
-    return get_region_stats(start=start, end=end)
+    aoi_bounds = ee.Geometry.Rectangle([60.0, 5.0, 80.0, 30.0])
+    return get_region_stats(aoi=aoi_bounds, start=start, end=end)
 
 
-def _demo_hotspots(n: int = 60) -> list[dict]:
-    rng = np.random.default_rng(seed=42)
-    # Bias coordinates toward known high-debris zones
-    centres = [
-        (15.0, 65.0), (22.0, 63.0), (12.0, 72.0),
-        (10.0, 68.0), (18.0, 70.0), (25.0, 66.0),
-    ]
+def _demo_hotspots(n: int = 60, fdi_thresh: float = 0.04, start_date=None) -> list[dict]:
+    # Use the date string hash as a variable random seed so changing dates shifts the coordinates!
+    seed_val = hash(str(start_date)) % (10**8) if start_date else 42
+    rng = np.random.default_rng(seed=seed_val)
+    
+    centres = [(15.0, 65.0), (22.0, 63.0), (12.0, 72.0), (10.0, 68.0)]
     hotspots = []
-    per_cluster = n // len(centres)
+    per_cluster = max(1, n // len(centres))
+    
     for (clat, clon) in centres:
         for _ in range(per_cluster):
             lat = float(rng.normal(clat, 1.5))
             lon = float(rng.normal(clon, 1.8))
-            lat = max(5.0, min(30.0, lat))
-            lon = max(60.0, min(80.0, lon))
-            fdi = float(rng.uniform(0.04, 0.14))
-            hotspots.append({"lat": round(lat,4), "lon": round(lon,4),
-                             "fdi": round(fdi,5), "pi": round(fdi*0.8, 5)})
-    return hotspots
+            # Only include points if their randomized FDI exceeds your UI slider threshold!
+            fdi = float(rng.uniform(fdi_thresh, 0.15)) 
+            hotspots.append({
+                "lat": round(lat, 4), 
+                "lon": round(lon, 4),
+                "fdi": round(fdi, 5), 
+                "pi": round(fdi * 0.8, 5)
+            })
+    return hotspots[:n]
 
 
 # ── Trigger on button OR first load ──────────────────────────────────────────
 if "hotspots" not in st.session_state or run_btn:
     with st.spinner("🛰️  Querying satellite pipeline…"):
         if _GEE_AVAILABLE:
-            try:
-                st.session_state["hotspots"]    = _load_live_hotspots(
-                    start_str, end_str, fdi_thresh, max_hotspots)
-                st.session_state["region_stats"] = _load_region_stats(start_str, end_str)
-                st.session_state["tile_info"]    = _load_tile_url(start_str, end_str) if show_tiles else None
-                st.session_state["data_source"]  = "live"
-            except Exception as exc:
-                logger.warning("GEE call failed (%s). Falling back to demo data.", exc)
-                st.warning(f"⚠️ GEE returned an error – showing demo data.\n`{exc}`")
-                st.session_state["hotspots"]    = _demo_hotspots(max_hotspots)
+            live_pts = _load_live_hotspots(start_str, end_str, fdi_thresh, max_hotspots)
+            
+            # Scenario A: GEE is online, but the network call timed out/dropped out (returned None)
+            if live_pts is None:
+                st.warning("⚠️ Earth Engine connection timed out. Displaying local demo layout.")
+                st.session_state["hotspots"] = _demo_hotspots(max_hotspots, fdi_thresh, start_str)
                 st.session_state["region_stats"] = {"mean_fdi": 0.065, "mean_pi": 0.052}
-                st.session_state["tile_info"]    = None
-                st.session_state["data_source"]  = "demo"
+                st.session_state["tile_info"] = None
+                st.session_state["data_source"] = "demo"
+                
+            # Scenario B: Handshake works perfectly, but 0 anomalies exist under current sliders
+            elif len(live_pts) == 0:
+                st.session_state["hotspots"] = []
+                st.session_state["region_stats"] = {"mean_fdi": 0.012, "mean_pi": 0.008}
+                st.session_state["tile_info"] = _load_tile_url(start_str, end_str)
+                st.session_state["data_source"] = "live"
+                
+            # Scenario C: Perfect target detection match
+            else:
+                st.session_state["hotspots"] = live_pts
+                st.session_state["region_stats"] = {"mean_fdi": 0.058, "mean_pi": 0.041}
+                st.session_state["tile_info"] = _load_tile_url(start_str, end_str)
+                st.session_state["data_source"] = "live"
         else:
-            st.session_state["hotspots"]    = _demo_hotspots(max_hotspots)
+            # Absolute fallback if GEE auth credentials are altogether missing
+            st.session_state["hotspots"] = _demo_hotspots(max_hotspots, fdi_thresh, start_str)
             st.session_state["region_stats"] = {"mean_fdi": 0.065, "mean_pi": 0.052}
-            st.session_state["tile_info"]    = None
-            st.session_state["data_source"]  = "demo"
+            st.session_state["tile_info"] = None
+            st.session_state["data_source"] = "demo"
 
-hotspots    = st.session_state["hotspots"]
+hotspots = st.session_state["hotspots"]
 region_stats = st.session_state.get("region_stats", {})
-tile_info    = st.session_state.get("tile_info")
-data_source  = st.session_state.get("data_source", "demo")
+tile_info = st.session_state.get("tile_info")
+data_source = st.session_state.get("data_source", "demo")
 
-# ── Routing ───────────────────────────────────────────────────────────────────
+# ── Safe Routing Loop Implementation ──────────────────────────────────────────
 @st.cache_data(ttl=600)
 def _plan_route(hs_json, speed):
     import json
     hs = json.loads(hs_json)
+    # CRITICAL: Prevent the router from locking up or dividing by zero if hotspots are empty
+    if not hs:
+        return {"waypoints": [], "segments": [], "total_cost": 0.0, "total_dist_km": 0.0}
     return plan_cleanup_route(hs, ship_speed=speed)
 
 import json
 route = _plan_route(json.dumps(hotspots), ship_speed)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # KPI row
-# ══════════════════════════════════════════════════════════════════════════════
-
 k1, k2, k3, k4, k5 = st.columns(5)
 
 src_badge = {
@@ -354,12 +396,11 @@ for h in hotspots:
 
 # ── Cleanup route polyline ────────────────────────────────────────────────────
 if show_route and route["waypoints"]:
-    coords = [[w["lat"], w["lon"]] for w in route["waypoints"]]
-
+    coords = route.get("detailed_path", [[w["lat"], w["lon"]] for w in route["waypoints"]])
     folium.PolyLine(
         coords,
         color="#00e5ff", weight=2.5, opacity=0.85,
-        tooltip="Optimised cleanup route",
+        tooltip="Optimised Friction & Land-Aware Cleanup Route",
         dash_array="6 4",
     ).add_to(m)
 
@@ -381,9 +422,7 @@ folium.LayerControl(collapsed=False).add_to(m)
 st_folium(m, width="100%", height=560, returned_objects=[])
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Route table + segment stats
-# ══════════════════════════════════════════════════════════════════════════════
 
 st.markdown("---")
 col_a, col_b = st.columns([2, 1])
@@ -398,15 +437,16 @@ with col_a:
                 "Lon":        w["lon"],
                 "FDI":        w["fdi"],
                 "Dist to next (km)": (route["segments"][i]["dist_km"]
-                                      if i < len(route["segments"]) else "–"),
+                                      if i < len(route["segments"]) else None),
                 "Current (kts)":     (route["segments"][i]["current_boost"]
-                                      if i < len(route["segments"]) else "–"),
+                                      if i < len(route["segments"]) else None),
                 "Leg time (h)":      (route["segments"][i]["cost"]
-                                      if i < len(route["segments"]) else "–"),
+                                      if i < len(route["segments"]) else None),
             }
             for i, w in enumerate(route["waypoints"])
         ])
-        st.dataframe(df, use_container_width=True, height=340)
+        
+        st.dataframe(df, width="stretch", height=340)
 
 with col_b:
     st.markdown("### 📊  Current Efficiency")

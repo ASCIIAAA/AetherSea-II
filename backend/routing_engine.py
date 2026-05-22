@@ -54,7 +54,8 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional
-
+import geopandas as gpd
+from shapely.geometry import LineString, Point
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -174,8 +175,7 @@ def _bearing_unit_vector(lat1: float, lon1: float,
         return 0.0, 0.0
     return dlon / mag, dlat / mag   # (east_component, north_component)
 
-
-# ── Edge cost with hydraulic friction ────────────────────────────────────────
+_OBSTACLE_ROUTER: Optional["ObstacleAvoidanceRouter"] = None
 
 def _edge_cost(
     lat1: float, lon1: float,
@@ -184,36 +184,49 @@ def _edge_cost(
     cf: CurrentField,
 ) -> dict:
     """
-    Compute the traversal cost (hours) from (lat1,lon1) → (lat2,lon2).
-
-    Physics
-    -------
-    1. Sample the current midpoint.
-    2. Project current onto ship bearing → scalar current_boost (m/s).
-    3. effective_speed = ship_speed + current_boost  (convert to km/h).
-    4. cost = distance_km / effective_speed_kmh.
+    Compute the traversal cost (hours) from (lat1,lon1) → (lat2,lon2),
+    accounting for multi-segment detours if land collision is detected.
     """
-    dist_km = _haversine_km(lat1, lon1, lat2, lon2)
+    global _OBSTACLE_ROUTER
+    if _OBSTACLE_ROUTER is None:
+        _OBSTACLE_ROUTER = ObstacleAvoidanceRouter()
+    # Get the real navigable sequence of micro-waypoints (direct or detoured)
+    path_points = _OBSTACLE_ROUTER.bypass_routing(lat1, lon1, lat2, lon2)
+    
+    total_dist_km = 0.0
+    total_cost_hours = 0.0
+    boosts = []
+    
+    # Iterate through each segment of the path sequence
+    for i in range(len(path_points) - 1):
+        p1_lat, p1_lon = path_points[i]
+        p2_lat, p2_lon = path_points[i+1]
+        
+        dist_km = _haversine_km(p1_lat, p1_lon, p2_lat, p2_lon)
+        total_dist_km += dist_km
 
-    mid_lat = (lat1 + lat2) / 2
-    mid_lon = (lon1 + lon2) / 2
-    u, v = cf.get_uv(mid_lat, mid_lon)   # m/s
+        mid_lat = (p1_lat + p2_lat) / 2
+        mid_lon = (p1_lon + p2_lon) / 2
+        u, v = cf.get_uv(mid_lat, mid_lon)   # m/s
 
-    ex, ny = _bearing_unit_vector(lat1, lon1, lat2, lon2)
-    # u is eastward, v is northward; ex is east component of bearing
-    current_boost_ms  = u * ex + v * ny
-    current_boost_kts = current_boost_ms / _KNOTS_TO_MS
+        ex, ny = _bearing_unit_vector(p1_lat, p1_lon, p2_lat, p2_lon)
+        current_boost_ms  = u * ex + v * ny
+        current_boost_kts = current_boost_ms / _KNOTS_TO_MS
+        boosts.append(current_boost_kts)
 
-    eff_speed_kts = max(ship_speed_knots + current_boost_kts, 0.5)  # floor 0.5 kts
-    eff_speed_kmh = eff_speed_kts * 1.852
-    cost_hours    = dist_km / eff_speed_kmh if eff_speed_kmh > 0 else 1e9
+        eff_speed_kts = max(ship_speed_knots + current_boost_kts, 0.5)  # floor 0.5 kts
+        eff_speed_kmh = eff_speed_kts * 1.852
+        cost_hours    = dist_km / eff_speed_kmh if eff_speed_kmh > 0 else 1e9
+        total_cost_hours += cost_hours
+
+    avg_boost_kts = sum(boosts) / len(boosts) if boosts else 0.0
 
     return {
-        "dist_km":       round(dist_km, 2),
-        "current_boost": round(current_boost_kts, 3),   # knots, + = tailwind
-        "cost":          round(cost_hours, 4),           # hours at sea
+        "dist_km":       round(total_dist_km, 2),
+        "current_boost": round(avg_boost_kts, 3),   # average knots across path legs
+        "cost":          round(total_cost_hours, 4), # total hours across path legs
+        "path_coords":   path_points                # Retain the micro-waypoints for mapping!
     }
-
 
 # ── Priority-aware hotspot ordering ──────────────────────────────────────────
 
@@ -305,8 +318,58 @@ def _two_opt(tour: list[int],
     logger.info("2-opt: %d iterations, final cost %.2f h", iterations, best_cost)
     return best
 
+class ObstacleAvoidanceRouter:
+    def __init__(self):
+        try:
+            # Modern, robust fallback to fetch low-res natural earth landmass geometries
+            world = gpd.read_file("https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.shp")
+            self.land_geom = world.unary_union
+        except Exception as e:
+            logger.warning(f"Could not download remote land shapes ({e}). Loading fallback empty geometry.")
+            # Fallback to empty geometry so the pipeline doesn't break if offline
+            from shapely.geometry import Polygon
+            self.land_geom = Polygon()
 
-# ── Public API ───────────────────────────────────────────────────────────────
+        # Define prominent navigation bypass nodes for the Arabian Sea to route around land
+        # Example: Point south of Cape Comorin/Kanyakumari to avoid clipping southern India
+        self.bypass_hubs = [
+            {"name": "South_India_Bypass", "lat": 7.5, "lon": 77.5},
+            {"name": "Oman_Cape_Bypass", "lat": 22.5, "lon": 60.0},
+            {"name": "Kathiawar_Peninsula_Bypass", "lat": 20.0, "lon": 69.0}
+        ]
+
+    def check_land_collision(self, lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
+        """Returns True if a straight tracking vector intersects mainland landmass coordinates."""
+        if self.land_geom.is_empty:
+            return False
+        # Note: Shapely coordinates use (Longitude, Latitude) order matching standard GIS formats
+        edge_line = LineString([(lon1, lat1), (lon2, lat2)])
+        return edge_line.intersects(self.land_geom)
+
+    def bypass_routing(self, lat1: float, lon1: float, lat2: float, lon2: float) -> list[tuple[float, float]]:
+        """
+        Validates path line transitions. If land is intersected, injects an optimal safe 
+        maritime transit node between coordinates; otherwise returns a direct path.
+        """
+        if not self.check_land_collision(lat1, lon1, lat2, lon2):
+            return [(lat1, lon1), (lat2, lon2)]
+        
+        # Select the closest safe maritime bypass hub to detour around the coast
+        best_hub = None
+        min_detour_dist = float('inf')
+        
+        # Calculate distance proxy to select best hub
+        for hub in self.bypass_hubs:
+            d = abs(hub["lat"] - ((lat1+lat2)/2)) + abs(hub["lon"] - ((lon1+lon2)/2))
+            if d < min_detour_dist:
+                min_detour_dist = d
+                best_hub = (hub["lat"], hub["lon"])
+                
+        if best_hub:
+            logger.info(f"Mainland intersection caught! Detouring route through bypass hub: {best_hub}")
+            return [(lat1, lon1), best_hub, (lat2, lon2)]
+            
+        return [(lat1, lon1), (lat2, lon2)]
 
 def plan_cleanup_route(
     hotspots:    list[dict],
@@ -356,6 +419,7 @@ def plan_cleanup_route(
     segments      = []
     total_cost    = 0.0
     total_dist_km = 0.0
+    detailed_path = []
 
     for k in range(len(ordered_waypoints) - 1):
         a = ordered_waypoints[k]
@@ -366,10 +430,15 @@ def plan_cleanup_route(
         segments.append(seg)
         total_cost    += seg["cost"]
         total_dist_km += seg["dist_km"]
+        if k==0:
+            detailed_path.extend(seg["path_coords"])
+        else:
+            detailed_path.extend(seg["path_coords"][1:])
 
     return {
         "waypoints":      ordered_waypoints,
         "segments":       segments,
         "total_cost":     round(total_cost, 2),
         "total_dist_km":  round(total_dist_km, 2),
+        "detailed_path": detailed_path,
     }

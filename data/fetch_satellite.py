@@ -15,11 +15,13 @@ _B_RED   = "B4"   # Red
 _B_SWIR  = "B11"  # Short-wave infrared (plastic signature)
 _B_GREEN = "B3"   # Green
 
-# Arabian Sea AOI defaults
-DEFAULT_AOI = ee.Geometry.Rectangle([60, 5, 80, 30])
 
+#DEFAULT_AOI = ee.Geometry.Rectangle([60, 5, 80, 30])
 COMPUTE_SCALE_M = 5_000   # metres
-
+def get_default_aoi():
+    return ee.Geometry.Rectangle(
+        [60, 5, 80, 30]
+    )
 
 # ── Initialisation helper ────────────────────────────────────────────────────
 
@@ -38,8 +40,7 @@ def init_gee(service_account: Optional[str] = None,
         logger.info("GEE initialised via interactive auth.")
 
 
-# ── Image acquisition ─────────────────────────────────────────────────────────
-
+# getting images
 def _get_clean_sentinel(aoi: ee.Geometry,
                         start: str = "2024-01-01",
                         end:   str = "2024-06-30",
@@ -51,7 +52,8 @@ def _get_clean_sentinel(aoi: ee.Geometry,
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_pct))
         .select([_B_NIR, _B_RED, _B_SWIR, _B_GREEN])
     )
-    return collection.median().clip(aoi)
+    # Divide by 10000 right here to scale all bands to standard 0.0 - 1.0 range!
+    return collection.median().clip(aoi).divide(10000)
 
 
 # ── Index calculation ─────────────────────────────────────────────────────────
@@ -79,7 +81,7 @@ def _mask_seaweed(image: ee.Image) -> ee.Image:
 
 
 def get_plastic_tile_url(
-    aoi:       ee.Geometry = DEFAULT_AOI,
+    aoi: Optional[ee.Geometry] = None,
     start:     str = "2024-01-01",
     end:       str = "2024-06-30",
     fdi_min:   float = 0.02,
@@ -126,7 +128,7 @@ def get_plastic_tile_url(
 # ── FIX 2: Downsampled hotspot extraction ────────────────────────────────────
 
 def get_hotspots(
-    aoi:        ee.Geometry = DEFAULT_AOI,
+    aoi: Optional[ee.Geometry] = None,
     start:      str = "2024-01-01",
     end:        str = "2024-06-30",
     fdi_thresh: float = 0.04,
@@ -193,7 +195,7 @@ def get_hotspots(
 # ── Regional statistics (single scalar summary) ──────────────────────────────
 
 def get_region_stats(
-    aoi:   ee.Geometry = DEFAULT_AOI,
+    aoi: Optional[ee.Geometry] = None,
     start: str = "2024-01-01",
     end:   str = "2024-06-30",
 ) -> dict:
@@ -244,7 +246,7 @@ def get_cloud_reduced_hotspots(
                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 15))
                   .sort('CLOUDY_PIXEL_PERCENTAGE'))
 
-    image = collection.first()
+    image = collection.median()
     
     if not image:
         logger.warning("No clear Sentinel-2 image found for this date range.")
@@ -273,25 +275,29 @@ def get_cloud_reduced_hotspots(
     plastic_mask = fdi_image.gt(fdi_threshold).And(ndvi_image.lt(ndvi_threshold))
 
     # 5. VECTOR DEBRIS REDUCTION (Google reduces pixels to vector hubs before extraction)
-    # Using 5,000 meter scale matching your default processing grid structure
+    # 5. VECTOR DEBRIS REDUCTION
     detected_vectors = plastic_mask.updateMask(plastic_mask).reduceToVectors(
         geometry=region,
         scale=5000, 
         maxPixels=1e7
     )
 
-    features = detected_vectors.getInfo().get('features', [])
+    # Convert complex shapes to clear coordinate center-points server-side!
+    centroid_points = detected_vectors.map(lambda f: f.set('geometry', f.geometry().centroid()))
+
+    features = centroid_points.getInfo().get('features', [])
     
     hotspots_out = []
     for f in features:
         geom = f.get('geometry', {})
+        # This will evaluate as True now that shapes are converted to center points!
         if geom and geom.get('type') == 'Point':
             lon, lat = geom.get('coordinates')
             hotspots_out.append({
                 "lat": round(float(lat), 4),
                 "lon": round(float(lon), 4),
-                "fdi": fdi_threshold, # Mapping proxy profile variables
-                "pi": 0.5
+                "fdi": float(fdi_threshold),
+                "pi": 0.05
             })
             
     logger.info(f"Memory-Safe GEE pipeline extracted {len(hotspots_out)} targets successfully.")
