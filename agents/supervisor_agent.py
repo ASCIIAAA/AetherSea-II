@@ -23,17 +23,12 @@ except Exception:
 
 
 class SupervisorAgent:
-    """
-    Main AI supervisor for AetherSea-II
-    Generates mission summaries + cleanup intelligence.
-    """
-
     def __init__(self):
         self.model = None
 
         if USE_GEMINI:
             try:
-                self.model = genai.GenerativeModel("gemini-1.5-flash")
+                self.model = genai.GenerativeModel("gemini-2.5-flash")
             except Exception:
                 self.model = None
 
@@ -44,19 +39,15 @@ class SupervisorAgent:
         region_stats: dict = None,
         source: str = "unknown",
     ) -> str:
-        """
-        Generates AI mission analysis report.
-        """
+        """ Generates AI mission analysis report. """
 
         hotspot_count = len(hotspots)
-
         mean_fdi = 0
 
         if region_stats:
             mean_fdi = region_stats.get("mean_fdi", 0)
 
         total_distance = route.get("total_dist_km", 0)
-
         total_time = route.get("total_cost", 0)
 
         # Fallback local intelligence

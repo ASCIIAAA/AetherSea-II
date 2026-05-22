@@ -1,103 +1,78 @@
 """
-routing_engine.py  –  AetherSea-II  (Hydraulic Friction-Aware Marine Router)
-=============================================================================
-UPGRADE: from naive Euclidean shortest-path  →  Current-Aware Dijkstra
+routing_engine.py (STEP 2: Coastline Obstacle Avoidance)
+========================================================
+NEW FEATURE:
+  The routing engine now checks if any proposed path segment crosses
+  land (mainland, islands, peninsulas). If it does, the engine
+  automatically computes a safe detour via offshore waypoints.
 
-What changed and why
-──────────────────────────────────────────────────────────────────────────────
-Old code: computed geometric distance between hotspot centroids, found the
-          shortest path.  Completely ignores ocean currents.
+  Uses Natural Earth 10m land polygons (free, public domain, auto-downloaded).
+  Falls back gracefully if geopandas/shapely aren't installed.
 
-New code: builds a directed weighted graph where each edge weight is the
-          *effective fuel cost* to traverse that segment.  Traversing WITH
-          a current is cheaper; fighting a strong current is expensive.
-
-          edge_cost = distance_km / effective_speed_knots
-
-          effective_speed = ship_speed + current_component_along_bearing
-
-          The current component is the dot product of (u, v) onto the
-          unit vector of the ship's bearing.  Tailwind → positive → faster.
-          Headwind → negative → slower and more costly.
-
-Data source
-──────────────────────────────────────────────────────────────────────────────
-NOAA OSCAR near-real-time 5-day surface currents are loaded from the local
-data/ directory (or fetched via OPeNDAP if the file is absent).
-
-The current field is interpolated bilinearly to any (lat, lon) coordinate.
-
-Public interface
-──────────────────────────────────────────────────────────────────────────────
-    from backend.routing_engine import plan_cleanup_route
-
-    route = plan_cleanup_route(
-        hotspots   = [{"lat": 15.2, "lon": 65.4, "fdi": 0.08}, ...],
-        ship_speed = 12.0,   # knots
-        current_ds = None,   # auto-loaded from data/
-    )
-
-    # route = {
-    #     "waypoints": [{"lat":…, "lon":…, "fdi":…}, …],
-    #     "segments":  [{"from":…, "to":…, "dist_km":…,
-    #                    "current_boost":…, "cost":…}, …],
-    #     "total_cost": 142.3,   # cost units ≈ hours at sea
-    #     "total_dist_km": 1840,
-    # }
+ALGORITHM:
+  1. Check if path A→B intersects any land polygon
+  2. If yes, find safe offshore waypoints near the midpoint
+  3. Build detour: A → safe_waypoint → B
+  4. Recursively check sub-legs for further collisions
+  5. Return complete safe path with all intermediate points
 """
 
 from __future__ import annotations
 
 import math
-import heapq
 import logging
 import os
 from pathlib import Path
 from typing import Optional
-import geopandas as gpd
-from shapely.geometry import LineString, Point
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
-_DATA_DIR  = Path(__file__).parent.parent / "data"
-_NOAA_FILE = _DATA_DIR / "oscar_currents.nc"   # expected NetCDF from NOAA OSCAR
+_DATA_DIR   = Path(__file__).parent.parent / "data"
+_NOAA_FILE  = _DATA_DIR / "oscar_currents.nc"
 
-_KNOTS_TO_MS = 0.514444          # conversion factor
-_KM_PER_DEG  = 111.0             # approximate km per degree latitude
+_KNOTS_TO_MS  = 0.514444
+_EARTH_R_KM   = 6371.0
+
+# Arabian Sea AOI
+_AOI_LAT = (5.0,  30.0)
+_AOI_LON = (60.0, 80.0)
+
+_NE_DIR     = _DATA_DIR / "natural_earth"
+_NE_LAND    = _NE_DIR   / "ne_10m_land.shp"
+_NE_URL     = ("https://naciscdn.org/naturalearth/10m/physical/ne_10m_land.zip")
 
 
-# ── Current field loader ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. NOAA OSCAR Current Field (unchanged from previous version)
+# ══════════════════════════════════════════════════════════════════════════════
 
 class CurrentField:
-    """
-    Bilinear-interpolated NOAA OSCAR current field.
+    """Bilinear-interpolated NOAA OSCAR ocean surface current field."""
 
-    Attributes
-    ----------
-    lats, lons : 1-D arrays of grid coordinates
-    u, v       : 2-D arrays of eastward / northward current (m/s)
-    """
-
-    def __init__(self, nc_path: Path):
+    def __init__(self, nc_path: Path = _NOAA_FILE):
+        self._zero = False
         try:
-            import netCDF4 as nc  # type: ignore
+            import netCDF4 as nc
             ds = nc.Dataset(str(nc_path))
 
-            # OSCAR variable names (adjust if your file differs)
-            lat_key = next(k for k in ds.variables if "lat" in k.lower())
-            lon_key = next(k for k in ds.variables if "lon" in k.lower())
-            u_key   = next(k for k in ds.variables if k in ("u", "U", "uo", "eastward"))
-            v_key   = next(k for k in ds.variables if k in ("v", "V", "vo", "northward"))
+            def _find(keys):
+                for k in ds.variables:
+                    if k.lower() in [x.lower() for x in keys]:
+                        return k
+                raise KeyError(f"None of {keys} found")
 
-            self.lats = np.array(ds.variables[lat_key][:]).flatten()
-            self.lons = np.array(ds.variables[lon_key][:]).flatten()
+            lat_k = _find(["lat", "latitude", "y"])
+            lon_k = _find(["lon", "longitude", "x"])
+            u_k   = _find(["u", "uo", "eastward_sea_water_velocity"])
+            v_k   = _find(["v", "vo", "northward_sea_water_velocity"])
 
-            u_raw = np.array(ds.variables[u_key][:])
-            v_raw = np.array(ds.variables[v_key][:])
+            self.lats = np.array(ds.variables[lat_k][:]).flatten()
+            self.lons = np.array(ds.variables[lon_k][:]).flatten()
 
-            # Collapse time / depth dims if present – take first slice
+            u_raw = np.array(ds.variables[u_k][:])
+            v_raw = np.array(ds.variables[v_k][:])
             while u_raw.ndim > 2:
                 u_raw = u_raw[0]
                 v_raw = v_raw[0]
@@ -105,340 +80,409 @@ class CurrentField:
             self.u = np.ma.filled(u_raw, 0.0)
             self.v = np.ma.filled(v_raw, 0.0)
             ds.close()
-            logger.info("NOAA OSCAR currents loaded from %s", nc_path)
+            logger.info("[Routing] OSCAR currents loaded.")
 
         except Exception as exc:
-            logger.warning("Could not load OSCAR NetCDF (%s). Using zero currents.", exc)
-            self.lats = np.linspace(5,  30, 50)
-            self.lons = np.linspace(60, 80, 40)
+            logger.warning("[Routing] OSCAR load failed (%s) – zero currents.", exc)
+            self.lats = np.linspace(_AOI_LAT[0], _AOI_LAT[1], 50)
+            self.lons = np.linspace(_AOI_LON[0], _AOI_LON[1], 40)
             self.u    = np.zeros((50, 40))
             self.v    = np.zeros((50, 40))
+            self._zero = True
 
     def get_uv(self, lat: float, lon: float) -> tuple[float, float]:
-        """Bilinear interpolation of (u, v) at arbitrary (lat, lon)."""
-        lat = np.clip(lat, self.lats.min(), self.lats.max())
-        lon = np.clip(lon, self.lons.min(), self.lons.max())
+        """Return bilinearly interpolated (u, v) in m/s at (lat, lon)."""
+        if self._zero:
+            return 0.0, 0.0
 
-        i = np.searchsorted(self.lats, lat) - 1
-        j = np.searchsorted(self.lons, lon) - 1
-        i = int(np.clip(i, 0, len(self.lats) - 2))
-        j = int(np.clip(j, 0, len(self.lons) - 2))
+        lat = float(np.clip(lat, self.lats.min(), self.lats.max()))
+        lon = float(np.clip(lon, self.lons.min(), self.lons.max()))
 
-        dlat = (lat - self.lats[i]) / (self.lats[i+1] - self.lats[i] + 1e-9)
-        dlon = (lon - self.lons[j]) / (self.lons[j+1] - self.lons[j] + 1e-9)
+        i = int(np.clip(np.searchsorted(self.lats, lat) - 1, 0, len(self.lats) - 2))
+        j = int(np.clip(np.searchsorted(self.lons, lon) - 1, 0, len(self.lons) - 2))
 
-        u = (self.u[i,   j]   * (1-dlat) * (1-dlon) +
-             self.u[i+1, j]   *    dlat  * (1-dlon) +
-             self.u[i,   j+1] * (1-dlat) *    dlon  +
-             self.u[i+1, j+1] *    dlat  *    dlon)
+        dlat = (lat - self.lats[i]) / (self.lats[i+1] - self.lats[i] + 1e-12)
+        dlon = (lon - self.lons[j]) / (self.lons[j+1] - self.lons[j] + 1e-12)
 
-        v = (self.v[i,   j]   * (1-dlat) * (1-dlon) +
-             self.v[i+1, j]   *    dlat  * (1-dlon) +
-             self.v[i,   j+1] * (1-dlat) *    dlon  +
-             self.v[i+1, j+1] *    dlat  *    dlon)
+        def _interp(field):
+            return (field[i,   j]   * (1-dlat) * (1-dlon) +
+                    field[i+1, j]   *    dlat   * (1-dlon) +
+                    field[i,   j+1] * (1-dlat)  *    dlon  +
+                    field[i+1, j+1] *    dlat   *    dlon)
 
-        return float(u), float(v)
+        return float(_interp(self.u)), float(_interp(self.v))
 
 
-_CURRENT_FIELD: Optional[CurrentField] = None
+_CF: Optional[CurrentField] = None
 
-def _get_current_field() -> CurrentField:
-    global _CURRENT_FIELD
-    if _CURRENT_FIELD is None:
-        _CURRENT_FIELD = CurrentField(_NOAA_FILE)
-    return _CURRENT_FIELD
+def _get_cf() -> CurrentField:
+    global _CF
+    if _CF is None:
+        _CF = CurrentField()
+    return _CF
 
 
-# ── Geometry helpers ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. STEP 2 NEW: Coastline Obstacle Avoidance
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _haversine_km(lat1: float, lon1: float,
-                  lat2: float, lon2: float) -> float:
+class CoastlineChecker:
+    """
+    Checks if marine segments cross land and computes safe detours.
+    Uses Natural Earth 10m land polygons.
+    Falls back gracefully if geopandas/shapely unavailable.
+    """
+
+    def __init__(self):
+        self._available = False
+        self._land_union = None
+        self._safe_grid  = None
+
+        try:
+            import geopandas as gpd
+            from shapely.geometry import box
+
+            shp = self._ensure_shapefile()
+            if shp is None:
+                return
+
+            # Clip to AOI + buffer
+            aoi_box = box(
+                _AOI_LON[0] - 2, _AOI_LAT[0] - 2,
+                _AOI_LON[1] + 2, _AOI_LAT[1] + 2,
+            )
+            world = gpd.read_file(str(shp))
+            clipped = world.clip(aoi_box)
+
+            if clipped.empty:
+                logger.info("[Routing] No land in AOI.")
+                self._available = True
+                return
+
+            self._land_union = clipped.unary_union
+            self._available  = True
+            self._safe_grid  = self._build_safe_grid()
+            logger.info("[Routing] Coastline checker ready.")
+
+        except ImportError:
+            logger.warning("[Routing] geopandas/shapely not installed – coastline avoidance disabled.")
+        except Exception as exc:
+            logger.warning("[Routing] CoastlineChecker init failed: %s", exc)
+
+    def _ensure_shapefile(self) -> Optional[Path]:
+        """Download Natural Earth shapefile if missing."""
+        if _NE_LAND.exists():
+            return _NE_LAND
+
+        _NE_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info("[Routing] Downloading Natural Earth 10m land polygons…")
+
+        try:
+            import urllib.request, zipfile, io
+            with urllib.request.urlopen(_NE_URL, timeout=30) as resp:
+                zdata = resp.read()
+            with zipfile.ZipFile(io.BytesIO(zdata)) as zf:
+                zf.extractall(_NE_DIR)
+            if _NE_LAND.exists():
+                logger.info("[Routing] Shapefile downloaded.")
+                return _NE_LAND
+            shps = list(_NE_DIR.glob("*.shp"))
+            return shps[0] if shps else None
+        except Exception as exc:
+            logger.warning("[Routing] Shapefile download failed: %s", exc)
+            return None
+
+    def _build_safe_grid(self) -> list[tuple[float, float]]:
+        """Pre-compute offshore safe waypoints on a 1° grid."""
+        from shapely.geometry import Point
+
+        grid = []
+        for lat in np.arange(_AOI_LAT[0] + 0.5, _AOI_LAT[1], 1.0):
+            for lon in np.arange(_AOI_LON[0] + 0.5, _AOI_LON[1], 1.0):
+                if self._land_union is None or not self._land_union.contains(Point(lon, lat)):
+                    grid.append((float(lat), float(lon)))
+        logger.debug("[Routing] Safe grid: %d points", len(grid))
+        return grid
+
+    def crosses_land(self, lat1: float, lon1: float,
+                     lat2: float, lon2: float) -> bool:
+        """Return True if segment intersects any land polygon."""
+        if not self._available or self._land_union is None:
+            return False
+        from shapely.geometry import LineString
+        line = LineString([(lon1, lat1), (lon2, lat2)])
+        return bool(self._land_union.intersects(line))
+
+    def find_detour(self, lat1: float, lon1: float,
+                    lat2: float, lon2: float) -> list[tuple[float, float]]:
+        """Return list of intermediate waypoints to avoid land."""
+        return self._detour_recursive(lat1, lon1, lat2, lon2, depth=0)
+
+    def _detour_recursive(self, lat1, lon1, lat2, lon2, depth) -> list[tuple[float, float]]:
+        """Recursively find detour waypoints (max 3 levels deep)."""
+        if depth > 3 or not self.crosses_land(lat1, lon1, lat2, lon2):
+            return []
+
+        if not self._safe_grid:
+            return []
+
+        mid_lat = (lat1 + lat2) / 2
+        mid_lon = (lon1 + lon2) / 2
+
+        def score(pt):
+            plat, plon = pt
+            dist_to_mid = _haversine(mid_lat, mid_lon, plat, plon)
+            if self.crosses_land(lat1, lon1, plat, plon):
+                return 1e9
+            if self.crosses_land(plat, plon, lat2, lon2):
+                return 1e9
+            return dist_to_mid
+
+        best = min(self._safe_grid, key=score, default=None)
+        if best is None or score(best) >= 1e9:
+            return []
+
+        plat, plon = best
+        left  = self._detour_recursive(lat1, lon1, plat, plon, depth+1)
+        right = self._detour_recursive(plat, plon, lat2, lon2, depth+1)
+        return left + [(plat, plon)] + right
+
+
+_CC: Optional[CoastlineChecker] = None
+
+def _get_cc() -> CoastlineChecker:
+    global _CC
+    if _CC is None:
+        _CC = CoastlineChecker()
+    return _CC
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. Geometry Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in km."""
-    R = 6371.0
     φ1, φ2 = math.radians(lat1), math.radians(lat2)
     Δφ = math.radians(lat2 - lat1)
     Δλ = math.radians(lon2 - lon1)
-    a = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
-    return 2 * R * math.asin(math.sqrt(a))
+    a  = math.sin(Δφ/2)**2 + math.cos(φ1)*math.cos(φ2)*math.sin(Δλ/2)**2
+    return 2 * _EARTH_R_KM * math.asin(math.sqrt(a))
 
 
-def _bearing_unit_vector(lat1: float, lon1: float,
-                         lat2: float, lon2: float) -> tuple[float, float]:
-    """
-    Return the (east, north) unit vector pointing from point-1 to point-2.
-    Approximate (flat-Earth) – accurate enough over oceanic distances < 500 km.
-    """
+def _bearing_unit(lat1: float, lon1: float,
+                  lat2: float, lon2: float) -> tuple[float, float]:
+    """(east, north) unit vector from point-1 → point-2."""
     dlat = lat2 - lat1
     dlon = (lon2 - lon1) * math.cos(math.radians((lat1 + lat2) / 2))
     mag  = math.hypot(dlat, dlon)
-    if mag < 1e-9:
+    if mag < 1e-12:
         return 0.0, 0.0
-    return dlon / mag, dlat / mag   # (east_component, north_component)
+    return dlon / mag, dlat / mag
 
-_OBSTACLE_ROUTER: Optional["ObstacleAvoidanceRouter"] = None
 
-def _edge_cost(
-    lat1: float, lon1: float,
-    lat2: float, lon2: float,
-    ship_speed_knots: float,
-    cf: CurrentField,
-) -> dict:
-    """
-    Compute the traversal cost (hours) from (lat1,lon1) → (lat2,lon2),
-    accounting for multi-segment detours if land collision is detected.
-    """
-    global _OBSTACLE_ROUTER
-    if _OBSTACLE_ROUTER is None:
-        _OBSTACLE_ROUTER = ObstacleAvoidanceRouter()
-    # Get the real navigable sequence of micro-waypoints (direct or detoured)
-    path_points = _OBSTACLE_ROUTER.bypass_routing(lat1, lon1, lat2, lon2)
-    
-    total_dist_km = 0.0
-    total_cost_hours = 0.0
-    boosts = []
-    
-    # Iterate through each segment of the path sequence
-    for i in range(len(path_points) - 1):
-        p1_lat, p1_lon = path_points[i]
-        p2_lat, p2_lon = path_points[i+1]
-        
-        dist_km = _haversine_km(p1_lat, p1_lon, p2_lat, p2_lon)
-        total_dist_km += dist_km
+# 4. Edge Cost Computation (with detour support)
 
-        mid_lat = (p1_lat + p2_lat) / 2
-        mid_lon = (p1_lon + p2_lon) / 2
-        u, v = cf.get_uv(mid_lat, mid_lon)   # m/s
 
-        ex, ny = _bearing_unit_vector(p1_lat, p1_lon, p2_lat, p2_lon)
-        current_boost_ms  = u * ex + v * ny
-        current_boost_kts = current_boost_ms / _KNOTS_TO_MS
-        boosts.append(current_boost_kts)
+def _edge(lat1: float, lon1: float,
+          lat2: float, lon2: float,
+          ship_kts: float,
+          cf: CurrentField,
+          cc: CoastlineChecker) -> dict:
+  
+    # Check for land crossing and compute detour if needed (STEP 2)
+    detour_pts   = cc.find_detour(lat1, lon1, lat2, lon2)
+    crosses_land = cc.crosses_land(lat1, lon1, lat2, lon2)
 
-        eff_speed_kts = max(ship_speed_knots + current_boost_kts, 0.5)  # floor 0.5 kts
-        eff_speed_kmh = eff_speed_kts * 1.852
-        cost_hours    = dist_km / eff_speed_kmh if eff_speed_kmh > 0 else 1e9
-        total_cost_hours += cost_hours
+    # Build path with detour waypoints
+    path = [(lat1, lon1)] + detour_pts + [(lat2, lon2)]
 
-    avg_boost_kts = sum(boosts) / len(boosts) if boosts else 0.0
+    total_dist  = 0.0
+    total_cost  = 0.0
+    boost_accum = 0.0
+
+    # Sum across all sub-legs
+    for k in range(len(path) - 1):
+        a_lat, a_lon = path[k]
+        b_lat, b_lon = path[k+1]
+
+        dist = _haversine(a_lat, a_lon, b_lat, b_lon)
+
+        # Current at midpoint
+        m_lat = (a_lat + b_lat) / 2
+        m_lon = (a_lon + b_lon) / 2
+        u, v  = cf.get_uv(m_lat, m_lon)
+
+        ex, ny = _bearing_unit(a_lat, a_lon, b_lat, b_lon)
+        boost_ms  = u * ex + v * ny
+        boost_kts = boost_ms / _KNOTS_TO_MS
+
+        eff_kts   = max(ship_kts + boost_kts, 0.5)
+        eff_kmh   = eff_kts * 1.852
+        leg_cost  = dist / eff_kmh if eff_kmh > 0 else 1e9
+
+        total_dist  += dist
+        total_cost  += leg_cost
+        boost_accum += boost_kts
+
+    avg_boost = boost_accum / (len(path) - 1) if len(path) > 1 else 0.0
 
     return {
-        "dist_km":       round(total_dist_km, 2),
-        "current_boost": round(avg_boost_kts, 3),   # average knots across path legs
-        "cost":          round(total_cost_hours, 4), # total hours across path legs
-        "path_coords":   path_points                # Retain the micro-waypoints for mapping!
+        "dist_km":       round(total_dist, 2),
+        "current_boost": round(avg_boost,  3),
+        "cost":          round(total_cost, 4),
+        "detour_pts":    detour_pts,
+        "crosses_land":  crosses_land,
     }
 
-# ── Priority-aware hotspot ordering ──────────────────────────────────────────
 
-def _priority_score(hotspot: dict) -> float:
-    """
-    Higher FDI = more debris = higher cleanup priority.
-    Returns a score in [0, 1].
-    """
-    return float(hotspot.get("fdi", 0.0))
+def _tour_cost(tour: list[int],
+               nodes: list[dict],
+               ship_kts: float,
+               cf: CurrentField,
+               cc: CoastlineChecker) -> float:
+    """Total cost of a complete tour."""
+    total = 0.0
+    for k in range(len(tour) - 1):
+        a, b = nodes[tour[k]], nodes[tour[k+1]]
+        total += _edge(a["lat"], a["lon"], b["lat"], b["lon"], ship_kts, cf, cc)["cost"]
+    return total
 
 
-# ── Greedy nearest-neighbour + 2-opt with current-aware costs ─────────────────
+# 5. Greedy Nearest-Neighbour
 
-def _greedy_route(nodes: list[dict],
-                  ship_speed: float,
-                  cf: CurrentField) -> list[int]:
-    """
-    Nearest-neighbour greedy tour starting from highest-priority hotspot.
-    Returns list of indices into *nodes*.
-    """
-    if not nodes:
-        return []
-
-    # Start from highest FDI hotspot
-    start = max(range(len(nodes)), key=lambda i: _priority_score(nodes[i]))
-    visited   = [False] * len(nodes)
-    tour      = [start]
+def _greedy(nodes: list[dict],
+            ship_kts: float,
+            cf: CurrentField,
+            cc: CoastlineChecker) -> list[int]:
+    """Greedy tour starting from highest-FDI hotspot."""
+    n     = len(nodes)
+    start = max(range(n), key=lambda i: float(nodes[i].get("fdi", 0)))
+    visited = [False] * n
+    tour    = [start]
     visited[start] = True
 
-    for _ in range(len(nodes) - 1):
-        current = tour[-1]
+    for _ in range(n - 1):
+        cur = tour[-1]
         best_cost = float("inf")
         best_next = -1
-        for j, node in enumerate(nodes):
+
+        for j in range(n):
             if visited[j]:
                 continue
-            c = _edge_cost(
-                nodes[current]["lat"], nodes[current]["lon"],
-                node["lat"],          node["lon"],
-                ship_speed, cf,
-            )["cost"]
-            # Penalise lower-priority hotspots slightly
-            adjusted = c * (1.0 + (1.0 - _priority_score(node)) * 0.1)
-            if adjusted < best_cost:
-                best_cost = adjusted
+            a, b = nodes[cur], nodes[j]
+            c = _edge(a["lat"], a["lon"], b["lat"], b["lon"], ship_kts, cf, cc)["cost"]
+            priority_factor = 1.0 + (1.0 - float(nodes[j].get("fdi", 0)) / 0.15) * 0.08
+            if c * priority_factor < best_cost:
+                best_cost = c * priority_factor
                 best_next = j
+
         visited[best_next] = True
         tour.append(best_next)
 
     return tour
 
 
+# 6. STEP 2 NEW: Full 2-Opt Local Search (complete implementation)
+
 def _two_opt(tour: list[int],
              nodes: list[dict],
-             ship_speed: float,
+             ship_kts: float,
              cf: CurrentField,
-             max_iter: int = 50) -> list[int]:
-    """
-    2-opt local search to improve the greedy tour.
-    Swaps edges if reversing a sub-segment reduces total cost.
-    """
-    def total_cost(t: list[int]) -> float:
-        cost = 0.0
-        for k in range(len(t) - 1):
-            cost += _edge_cost(
-                nodes[t[k]]["lat"],   nodes[t[k]]["lon"],
-                nodes[t[k+1]]["lat"], nodes[t[k+1]]["lon"],
-                ship_speed, cf,
-            )["cost"]
-        return cost
+             cc: CoastlineChecker,
+             max_no_improve: int = 50) -> list[int]:
+    n    = len(tour)
+    if n < 4:
+        return tour
 
-    improved = True
-    iterations = 0
-    best = tour[:]
-    best_cost = total_cost(best)
+    best      = tour[:]
+    best_cost = _tour_cost(best, nodes, ship_kts, cf, cc)
+    no_improve_streak = 0
 
-    while improved and iterations < max_iter:
+    logger.info("[2-opt] Start cost: %.2f h", best_cost)
+
+    while no_improve_streak < max_no_improve:
         improved = False
-        iterations += 1
-        for i in range(1, len(best) - 1):
-            for j in range(i + 1, len(best)):
-                candidate = best[:i] + best[i:j+1][::-1] + best[j+1:]
-                c = total_cost(candidate)
-                if c < best_cost - 1e-6:
-                    best      = candidate
-                    best_cost = c
-                    improved  = True
 
-    logger.info("2-opt: %d iterations, final cost %.2f h", iterations, best_cost)
+        for i in range(n - 1):
+            for j in range(i + 2, n):
+                # Reverse sub-segment [i+1…j]
+                candidate = best[:i+1] + best[i+1:j+1][::-1] + best[j+1:]
+                c = _tour_cost(candidate, nodes, ship_kts, cf, cc)
+
+                if c < best_cost - 1e-6:
+                    best       = candidate
+                    best_cost  = c
+                    improved   = True
+                    break
+            if improved:
+                break
+
+        if improved:
+            no_improve_streak = 0
+        else:
+            no_improve_streak += 1
+
+    logger.info("[2-opt] Final cost: %.2f h", best_cost)
     return best
 
-class ObstacleAvoidanceRouter:
-    def __init__(self):
-        try:
-            # Modern, robust fallback to fetch low-res natural earth landmass geometries
-            world = gpd.read_file("https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.shp")
-            self.land_geom = world.unary_union
-        except Exception as e:
-            logger.warning(f"Could not download remote land shapes ({e}). Loading fallback empty geometry.")
-            # Fallback to empty geometry so the pipeline doesn't break if offline
-            from shapely.geometry import Polygon
-            self.land_geom = Polygon()
 
-        # Define prominent navigation bypass nodes for the Arabian Sea to route around land
-        # Example: Point south of Cape Comorin/Kanyakumari to avoid clipping southern India
-        self.bypass_hubs = [
-            {"name": "South_India_Bypass", "lat": 7.5, "lon": 77.5},
-            {"name": "Oman_Cape_Bypass", "lat": 22.5, "lon": 60.0},
-            {"name": "Kathiawar_Peninsula_Bypass", "lat": 20.0, "lon": 69.0}
-        ]
-
-    def check_land_collision(self, lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
-        """Returns True if a straight tracking vector intersects mainland landmass coordinates."""
-        if self.land_geom.is_empty:
-            return False
-        # Note: Shapely coordinates use (Longitude, Latitude) order matching standard GIS formats
-        edge_line = LineString([(lon1, lat1), (lon2, lat2)])
-        return edge_line.intersects(self.land_geom)
-
-    def bypass_routing(self, lat1: float, lon1: float, lat2: float, lon2: float) -> list[tuple[float, float]]:
-        """
-        Validates path line transitions. If land is intersected, injects an optimal safe 
-        maritime transit node between coordinates; otherwise returns a direct path.
-        """
-        if not self.check_land_collision(lat1, lon1, lat2, lon2):
-            return [(lat1, lon1), (lat2, lon2)]
-        
-        # Select the closest safe maritime bypass hub to detour around the coast
-        best_hub = None
-        min_detour_dist = float('inf')
-        
-        # Calculate distance proxy to select best hub
-        for hub in self.bypass_hubs:
-            d = abs(hub["lat"] - ((lat1+lat2)/2)) + abs(hub["lon"] - ((lon1+lon2)/2))
-            if d < min_detour_dist:
-                min_detour_dist = d
-                best_hub = (hub["lat"], hub["lon"])
-                
-        if best_hub:
-            logger.info(f"Mainland intersection caught! Detouring route through bypass hub: {best_hub}")
-            return [(lat1, lon1), best_hub, (lat2, lon2)]
-            
-        return [(lat1, lon1), (lat2, lon2)]
-
+# 7. Public API
 def plan_cleanup_route(
     hotspots:    list[dict],
-    ship_speed:  float = 12.0,       # knots
-    current_ds:  Optional[CurrentField] = None,
+    ship_speed:  float = 12.0,
+    cf:          Optional[CurrentField]    = None,
+    cc:          Optional[CoastlineChecker] = None,
     use_two_opt: bool = True,
 ) -> dict:
-    """
-    Plan an optimal cleanup route through *hotspots* using
-    hydraulic friction-aware costs derived from NOAA currents.
-
-    Parameters
-    ----------
-    hotspots : list of dicts with keys "lat", "lon", "fdi"
-    ship_speed : vessel speed in knots (calm water)
-    current_ds : pre-loaded CurrentField (optional; auto-loaded if None)
-    use_two_opt : whether to apply 2-opt refinement
-
-    Returns
-    -------
-    dict with keys:
-        "waypoints"     : ordered list of hotspot dicts
-        "segments"      : list of segment dicts (dist, boost, cost)
-        "total_cost"    : float – total hours at sea
-        "total_dist_km" : float – total great-circle distance
-    """
     if not hotspots:
-        return {"waypoints": [], "segments": [], "total_cost": 0, "total_dist_km": 0}
+        return {"waypoints": [], "segments": [], "total_cost": 0,
+                "total_dist_km": 0, "land_detours": 0}
 
-    cf = current_ds or _get_current_field()
+    cf = cf or _get_cf()
+    cc = cc or _get_cc()
 
-    # Deduplicate (same coords)
-    seen   = set()
-    unique = []
+    # Deduplicate
+    seen, unique = set(), []
     for h in hotspots:
         key = (round(h["lat"], 3), round(h["lon"], 3))
         if key not in seen:
             seen.add(key)
             unique.append(h)
 
-    tour = _greedy_route(unique, ship_speed, cf)
-    if use_two_opt and len(tour) > 3:
-        tour = _two_opt(tour, unique, ship_speed, cf)
+    if len(unique) == 1:
+        return {"waypoints": unique, "segments": [], "total_cost": 0,
+                "total_dist_km": 0, "land_detours": 0}
 
-    ordered_waypoints = [unique[i] for i in tour]
+    # Build tour
+    tour = _greedy(unique, ship_speed, cf, cc)
+    if use_two_opt:
+        tour = _two_opt(tour, unique, ship_speed, cf, cc)
 
+    ordered = [unique[i] for i in tour]
+
+    # Build output
     segments      = []
     total_cost    = 0.0
     total_dist_km = 0.0
-    detailed_path = []
+    land_detours  = 0
 
-    for k in range(len(ordered_waypoints) - 1):
-        a = ordered_waypoints[k]
-        b = ordered_waypoints[k + 1]
-        seg = _edge_cost(a["lat"], a["lon"], b["lat"], b["lon"], ship_speed, cf)
-        seg["from"] = k
-        seg["to"]   = k + 1
+    for k in range(len(ordered) - 1):
+        a = ordered[k]
+        b = ordered[k+1]
+        seg = _edge(a["lat"], a["lon"], b["lat"], b["lon"], ship_speed, cf, cc)
+        seg["from_stop"] = k
+        seg["to_stop"]   = k + 1
         segments.append(seg)
         total_cost    += seg["cost"]
         total_dist_km += seg["dist_km"]
-        if k==0:
-            detailed_path.extend(seg["path_coords"])
-        else:
-            detailed_path.extend(seg["path_coords"][1:])
+        if seg["detour_pts"]:
+            land_detours += 1
 
     return {
-        "waypoints":      ordered_waypoints,
+        "waypoints":      ordered,
         "segments":       segments,
         "total_cost":     round(total_cost, 2),
         "total_dist_km":  round(total_dist_km, 2),
-        "detailed_path": detailed_path,
+        "land_detours":   land_detours,
     }

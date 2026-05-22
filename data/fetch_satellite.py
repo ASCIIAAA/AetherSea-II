@@ -1,3 +1,20 @@
+"""
+fetch_satellite.py (STEP 1 FIXED VERSION)
+==========================================
+KEY CHANGE:
+  The get_cloud_reduced_hotspots() function now properly extracts actual
+  FDI and PI values from the computed raster instead of using hardcoded
+  placeholder values.
+
+  Before:
+    "fdi": round(fdi_threshold, 5),  # just echoes the threshold
+    "pi": 0.05,                       # hardcoded dummy
+
+  After:
+    "fdi": round(props.get("FDI", 0), 5),  # actual computed FDI value
+    "pi": round(props.get("PI", 0), 5),    # actual computed PI value
+"""
+
 from __future__ import annotations
 
 import os
@@ -255,78 +272,55 @@ def get_region_stats(
     }
 
 
-# ─────────────────────────────────────────────────────────────
-# CLOUD REDUCED HOTSPOTS
-# ─────────────────────────────────────────────────────────────
+# CLOUD REDUCED HOTSPOTS (STEP 1 IMPROVED)
 def get_cloud_reduced_hotspots(
-    lon_range,
-    lat_range,
-    start_date,
-    end_date,
-    fdi_threshold=0.012,
-    ndvi_threshold=0.2,
+    lon_range, lat_range, start_date, end_date, fdi_threshold=0.012, ndvi_threshold=0.2
 ):
-    region = ee.Geometry.Rectangle([
-        lon_range[0],
-        lat_range[0],
-        lon_range[1],
-        lat_range[1],
-    ])
+    region = ee.Geometry.Rectangle([lon_range[0], lat_range[0], lon_range[1], lat_range[1]])
 
-    image = _get_clean_sentinel(
-        aoi=region,
-        start=start_date,
-        end=end_date,
+    collection = (
+        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+        .filterBounds(region)
+        .filterDate(start_date, end_date)
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 15)) # Strictly drop cloudy tiles early
+        .map(_mask_s2_clouds)
+    )
+    
+    base_image = collection.median().clip(region).divide(10000)
+    nir = base_image.select("B8")
+    red = base_image.select("B4")
+    swir = base_image.select("B11")
+
+    fdi = nir.subtract(red.add(swir)).rename("FDI")
+    pi = nir.divide(nir.add(red)).rename("PI")
+    ndvi = base_image.normalizedDifference(["B8", "B4"]).rename("NDVI")
+
+    # Plastic mask: High FDI + Low NDVI
+    plastic_mask = fdi.gt(fdi_threshold).And(ndvi.lt(ndvi_threshold))
+
+    # Build composite for sampling
+    analysis_image = base_image.addBands([fdi, pi, ndvi]).updateMask(plastic_mask)
+
+    # Sample targets server-side
+    samples = analysis_image.select(["FDI", "PI"]).sample(
+        region=region,
+        scale=COMPUTE_SCALE_M,
+        numPixels=150,  # Lowered slightly for lightning-fast demo responses
+        geometries=True,
+        seed=42,
     )
 
-    nir = image.select("B8")
-    red = image.select("B4")
-    swir = image.select("B11")
-
-    fdi = nir.subtract(
-        red.add(swir)
-    ).rename("FDI")
-
-    ndvi = image.normalizedDifference(
-        ["B8", "B4"]
-    ).rename("NDVI")
-
-    plastic_mask = (
-        fdi.gt(fdi_threshold)
-        .And(ndvi.lt(ndvi_threshold))
-    )
-
-    vectors = (
-        plastic_mask
-        .selfMask()
-        .reduceToVectors(
-            geometry=region,
-            scale=5000,
-            maxPixels=1e7,
-        )
-    )
-
-    centroids = vectors.map(
-        lambda f: f.centroid()
-    )
-
-    features = centroids.getInfo()["features"]
-
+    features = samples.getInfo()["features"]
     hotspots = []
 
     for f in features:
         coords = f["geometry"]["coordinates"]
-
+        props = f["properties"]
         hotspots.append({
             "lat": round(coords[1], 4),
             "lon": round(coords[0], 4),
-            "fdi": round(fdi_threshold, 5),
-            "pi": 0.05,
+            "fdi": round(props.get("FDI", 0), 5),
+            "pi": round(props.get("PI", 0), 5),
         })
-
-    logger.info(
-        "Memory-safe pipeline returned %d hotspots",
-        len(hotspots)
-    )
 
     return hotspots
