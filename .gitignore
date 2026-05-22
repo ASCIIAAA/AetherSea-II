@@ -20,3 +20,8 @@ data/cache/
 .idea/
 .vscode/
 *aethersea-*.json
+.env
+.streamlit/secrets.toml
+*.json
+venv/
+pycache/
