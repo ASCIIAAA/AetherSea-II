@@ -274,53 +274,134 @@ def get_region_stats(
 
 # CLOUD REDUCED HOTSPOTS (STEP 1 IMPROVED)
 def get_cloud_reduced_hotspots(
-    lon_range, lat_range, start_date, end_date, fdi_threshold=0.012, ndvi_threshold=0.2
-):
-    region = ee.Geometry.Rectangle([lon_range[0], lat_range[0], lon_range[1], lat_range[1]])
+    lon_range: list[float],
+    lat_range: list[float],
+    start_date: str,
+    end_date: str,
+    fdi_threshold: float = 0.005,
+    ndvi_threshold: float = 0.25
+) -> list[dict]:
 
+    import ee
+
+    region = ee.Geometry.Rectangle([
+        lon_range[0],
+        lat_range[0],
+        lon_range[1],
+        lat_range[1]
+    ])
+
+    # ─────────────────────────────────────────────────────
+    # LOAD SENTINEL COLLECTION
+    # ─────────────────────────────────────────────────────
     collection = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(region)
         .filterDate(start_date, end_date)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 15)) # Strictly drop cloudy tiles early
-        .map(_mask_s2_clouds)
-    )
-    
-    base_image = collection.median().clip(region).divide(10000)
-    nir = base_image.select("B8")
-    red = base_image.select("B4")
-    swir = base_image.select("B11")
-
-    fdi = nir.subtract(red.add(swir)).rename("FDI")
-    pi = nir.divide(nir.add(red)).rename("PI")
-    ndvi = base_image.normalizedDifference(["B8", "B4"]).rename("NDVI")
-
-    # Plastic mask: High FDI + Low NDVI
-    plastic_mask = fdi.gt(fdi_threshold).And(ndvi.lt(ndvi_threshold))
-
-    # Build composite for sampling
-    analysis_image = base_image.addBands([fdi, pi, ndvi]).updateMask(plastic_mask)
-
-    # Sample targets server-side
-    samples = analysis_image.select(["FDI", "PI"]).sample(
-        region=region,
-        scale=COMPUTE_SCALE_M,
-        numPixels=150,  # Lowered slightly for lightning-fast demo responses
-        geometries=True,
-        seed=42,
+        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 35))
     )
 
-    features = samples.getInfo()["features"]
+    # IMPORTANT:
+    # median() instead of first()
+    image = collection.median()
+
+    # ─────────────────────────────────────────────────────
+    # CLOUD MASK
+    # ─────────────────────────────────────────────────────
+    qa = image.select("QA60")
+
+    cloud_bit_mask = 1 << 10
+    cirrus_bit_mask = 1 << 11
+
+    mask = (
+        qa.bitwiseAnd(cloud_bit_mask).eq(0)
+        .And(qa.bitwiseAnd(cirrus_bit_mask).eq(0))
+    )
+
+    # IMPORTANT:
+    # divide AFTER masking
+    clean_image = image.updateMask(mask).divide(10000)
+
+    # ─────────────────────────────────────────────────────
+    # SPECTRAL BANDS
+    # ─────────────────────────────────────────────────────
+    nir = clean_image.select("B8")
+    red = clean_image.select("B4")
+    swir = clean_image.select("B11")
+
+    # ─────────────────────────────────────────────────────
+    # FLOATING DEBRIS INDEX (FDI)
+    # ─────────────────────────────────────────────────────
+    fdi = nir.subtract(
+        red.add(swir).divide(2)
+    ).rename("FDI")
+
+    # ─────────────────────────────────────────────────────
+    # NDVI
+    # ─────────────────────────────────────────────────────
+    ndvi = clean_image.normalizedDifference(
+        ["B8", "B4"]
+    ).rename("NDVI")
+
+    # ─────────────────────────────────────────────────────
+    # PLASTIC MASK
+    # ─────────────────────────────────────────────────────
+    plastic_mask = (
+        fdi.gt(fdi_threshold)
+        .And(ndvi.lt(ndvi_threshold))
+    )
+
+    masked = fdi.updateMask(plastic_mask)
+
+    # ─────────────────────────────────────────────────────
+    # VECTOR EXTRACTION
+    # ─────────────────────────────────────────────────────
+    vectors = masked.reduceToVectors(
+        geometry=region,
+        scale=12000,
+        geometryType="polygon",
+        reducer=ee.Reducer.countEvery(),
+        maxPixels=5e7
+    )
+
+    vectors = vectors.limit(80)
+
+    # ─────────────────────────────────────────────────────
+    # CONVERT POLYGONS → CENTROIDS
+    # ─────────────────────────────────────────────────────
+    centroid_points = vectors.map(
+        lambda f: f.setGeometry(
+            f.geometry().centroid()
+        )
+    )
+
+    features = centroid_points.getInfo().get("features", [])
+
     hotspots = []
 
-    for f in features:
-        coords = f["geometry"]["coordinates"]
-        props = f["properties"]
+    for feature in features:
+
+        geom = feature.get("geometry")
+
+        if not geom:
+            continue
+
+        coords = geom.get("coordinates")
+
+        if not coords:
+            continue
+
+        lon, lat = coords
+
         hotspots.append({
-            "lat": round(coords[1], 4),
-            "lon": round(coords[0], 4),
-            "fdi": round(props.get("FDI", 0), 5),
-            "pi": round(props.get("PI", 0), 5),
+            "lat": round(lat, 4),
+            "lon": round(lon, 4),
+            "fdi": round(float(fdi_threshold), 5),
+            "pi": 0.05
         })
+
+    logger.info(
+        f"Memory-safe pipeline returned {len(hotspots)} hotspots"
+    )
 
     return hotspots

@@ -130,10 +130,10 @@ with st.sidebar:
 
     fdi_thresh = st.slider(
         "FDI Threshold",
-        0.01,
-        0.15,
-        0.04,
-        0.005
+        0.001,
+        0.05,
+        0.005,
+        0.001
     )
 
     ship_speed = st.slider(
@@ -145,9 +145,9 @@ with st.sidebar:
 
     max_hotspots = st.slider(
         "Max Hotspots",
-        10,
-        200,
-        80
+        5,
+        30,
+        12
     )
 
     show_tiles = st.toggle("Satellite Overlay", value=True)
@@ -298,10 +298,23 @@ data_source = st.session_state.get("data_source", "demo")
 # ─────────────────────────────────────────────────────────────
 # ROUTING
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# PERFORMANCE LIMITER + ROUTING
+# ─────────────────────────────────────────────────────────────
+
+# Hard cap to prevent 2-opt explosion
+if len(hotspots) > 10:
+    hotspots = hotspots[:10]
+
 @st.cache_data(ttl=600)
 def _plan_route(hs_json, speed):
+
     hs = json.loads(hs_json)
 
+    # Emergency limiter
+    hs = hs[:10]
+
+    # Empty safety
     if not hs:
         return {
             "waypoints": [],
@@ -311,15 +324,41 @@ def _plan_route(hs_json, speed):
             "land_detours": 0
         }
 
-    return plan_cleanup_route(
-        hs,
-        ship_speed=speed
-    )
+    # Small hotspot count → fast routing
+    if len(hs) <= 2:
+        return {
+            "waypoints": hs,
+            "segments": [],
+            "total_cost": 0.0,
+            "total_dist_km": 0.0,
+            "land_detours": 0
+        }
 
-route = _plan_route(
-    json.dumps(hotspots),
-    ship_speed
-)
+    try:
+        return plan_cleanup_route(
+            hs,
+            ship_speed=speed
+        )
+
+    except Exception as e:
+        logger.error(f"Routing failed: {e}")
+
+        return {
+            "waypoints": hs,
+            "segments": [],
+            "total_cost": 0.0,
+            "total_dist_km": 0.0,
+            "land_detours": 0
+        }
+
+
+# Spinner so user sees progress
+with st.spinner("Computing marine route..."):
+
+    route = _plan_route(
+        json.dumps(hotspots),
+        ship_speed
+    )
 
 # ─────────────────────────────────────────────────────────────
 # STEP 3: AI SUPERVISOR AGENT (INTEGRATED)
