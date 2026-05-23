@@ -136,11 +136,13 @@ class CoastlineChecker:
     def __init__(self):
         self._available = False
         self._land_union = None
+        self._prepared_land = None
         self._safe_grid  = None
 
         try:
             import geopandas as gpd
             from shapely.geometry import box
+            from shapely.prepared import prep
 
             shp = self._ensure_shapefile()
             if shp is None:
@@ -160,6 +162,7 @@ class CoastlineChecker:
                 return
 
             self._land_union = clipped.unary_union
+            self._prepared_land = prep(self._land_union)
             self._available  = True
             self._safe_grid  = self._build_safe_grid()
             logger.info("[Routing] Coastline checker ready.")
@@ -197,9 +200,10 @@ class CoastlineChecker:
         from shapely.geometry import Point
 
         grid = []
+        prepared = self._prepared_land
         for lat in np.arange(_AOI_LAT[0] + 0.5, _AOI_LAT[1], 1.0):
             for lon in np.arange(_AOI_LON[0] + 0.5, _AOI_LON[1], 1.0):
-                if self._land_union is None or not self._land_union.contains(Point(lon, lat)):
+                if prepared is None or not prepared.contains(Point(lon, lat)):
                     grid.append((float(lat), float(lon)))
         logger.debug("[Routing] Safe grid: %d points", len(grid))
         return grid
@@ -211,6 +215,8 @@ class CoastlineChecker:
             return False
         from shapely.geometry import LineString
         line = LineString([(lon1, lat1), (lon2, lat2)])
+        if self._prepared_land is not None:
+            return bool(self._prepared_land.intersects(line))
         return bool(self._land_union.intersects(line))
 
     def find_detour(self, lat1: float, lon1: float,
@@ -283,12 +289,16 @@ def _bearing_unit(lat1: float, lon1: float,
 
 # 4. Edge Cost Computation (with detour support)
 
+_EDGE_CACHE = {}
 
 def _edge(lat1: float, lon1: float,
           lat2: float, lon2: float,
           ship_kts: float,
           cf: CurrentField,
           cc: CoastlineChecker) -> dict:
+    key = (lat1, lon1, lat2, lon2, ship_kts)
+    if key in _EDGE_CACHE:
+        return _EDGE_CACHE[key]
   
     # Check for land crossing and compute detour if needed (STEP 2)
     detour_pts   = cc.find_detour(lat1, lon1, lat2, lon2)
@@ -327,13 +337,15 @@ def _edge(lat1: float, lon1: float,
 
     avg_boost = boost_accum / (len(path) - 1) if len(path) > 1 else 0.0
 
-    return {
+    res = {
         "dist_km":       round(total_dist, 2),
         "current_boost": round(avg_boost,  3),
         "cost":          round(total_cost, 4),
         "detour_pts":    detour_pts,
         "crosses_land":  crosses_land,
     }
+    _EDGE_CACHE[key] = res
+    return res
 
 
 def _tour_cost(tour: list[int],
@@ -397,11 +409,11 @@ def _two_opt(tour: list[int],
 
     best      = tour[:]
     best_cost = _tour_cost(best, nodes, ship_kts, cf, cc)
-    no_improve_streak = 0
 
     logger.info("[2-opt] Start cost: %.2f h", best_cost)
 
-    while no_improve_streak < max_no_improve:
+    improved = True
+    while improved:
         improved = False
 
         for i in range(n - 1):
@@ -417,11 +429,6 @@ def _two_opt(tour: list[int],
                     break
             if improved:
                 break
-
-        if improved:
-            no_improve_streak = 0
-        else:
-            no_improve_streak += 1
 
     logger.info("[2-opt] Final cost: %.2f h", best_cost)
     return best

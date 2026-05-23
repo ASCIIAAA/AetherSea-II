@@ -1,14 +1,3 @@
-"""
-app.py (STEP 3: Supervisor Agent Integration)
-==============================================
-KEY CHANGES:
-  1. Supervisor agent is now properly called within the data pipeline
-  2. Agent receives hotspots, route, and region_stats (not just mock data)
-  3. Mission report is displayed in an expandable section on the dashboard
-  4. Graceful fallback to templated report if Gemini API unavailable
-  5. Error handling doesn't crash the entire app
-"""
-
 from __future__ import annotations
 
 import os
@@ -36,11 +25,31 @@ import numpy as np
 
 # AGENTS
 from agents.supervisor_agent import SupervisorAgent
+
+import sys
+try:
+    with open("c:/Users/ASUS/AetherSea/debug_paths.txt", "w") as debug_f:
+        debug_f.write("sys.path:\n" + "\n".join(sys.path) + "\n\n")
+        try:
+            import ee
+            debug_f.write(f"ee path: {ee.__file__}\n")
+        except Exception as e:
+            debug_f.write(f"ee import failed: {e}\n")
+        try:
+            import streamlit as st_debug
+            debug_f.write(f"streamlit path: {st_debug.__file__}\n")
+        except Exception as e:
+            debug_f.write(f"streamlit import failed: {e}\n")
+except Exception as e:
+    pass
+
+
 # BACKEND
 from backend.routing_engine import plan_cleanup_route
 
-
+# ─────────────────────────────────────────────────────────────
 # STREAMLIT CONFIG
+# ─────────────────────────────────────────────────────────────
 
 st.set_page_config(
     page_title="AetherSea-II | Marine Debris Intelligence",
@@ -83,25 +92,21 @@ except Exception as e:
 # ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-
 html, body, [class*="css"] {
     background-color: #050d1a;
     color: white;
 }
-
 .main-title {
     font-size: 2.8rem;
     font-weight: 800;
     color: #00e5ff;
 }
-
 .metric-card {
     background: #0d1b2a;
     border: 1px solid #1565c0;
     border-radius: 10px;
     padding: 1rem;
 }
-
 .ai-summary {
     background: #0a1530;
     border-left: 4px solid #1976d2;
@@ -109,16 +114,15 @@ html, body, [class*="css"] {
     border-radius: 8px;
     margin: 1rem 0;
 }
-
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# SIDEBAR
+# SIDEBAR CONTROLS
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
 
-    st.title("⚙️ Mission Control")
+    st.title("⚙️  Mission Control")
 
     date_range = st.date_input(
         "Analysis Window",
@@ -129,12 +133,13 @@ with st.sidebar:
     end_str = str(date_range[1])
 
     fdi_thresh = st.slider(
-        "FDI Threshold",
-        0.001,
-        0.05,
-        0.005,
-        0.001
-    )
+    "FDI Threshold",
+    0.001,
+    0.05,
+    0.006,
+    0.0005,
+    format="%.4f"
+)
 
     ship_speed = st.slider(
         "Vessel Speed",
@@ -145,9 +150,9 @@ with st.sidebar:
 
     max_hotspots = st.slider(
         "Max Hotspots",
-        5,
-        30,
-        12
+        10,
+        200,
+        80
     )
 
     show_tiles = st.toggle("Satellite Overlay", value=True)
@@ -169,9 +174,8 @@ with st.sidebar:
         if gee_error_msg:
             st.caption(gee_error_msg)
 
-# ─────────────────────────────────────────────────────────────
+
 # HEADER
-# ─────────────────────────────────────────────────────────────
 st.markdown(
     '<p class="main-title">🌊 AetherSea-II</p>',
     unsafe_allow_html=True
@@ -179,15 +183,13 @@ st.markdown(
 
 st.caption("Marine Debris Intelligence Platform  ·  Arabian Sea")
 
-# ─────────────────────────────────────────────────────────────
 # DEMO HOTSPOTS
-# ─────────────────────────────────────────────────────────────
 def _demo_hotspots(
     n: int = 60,
     fdi_thresh: float = 0.04,
     start_date=None
 ):
-
+    """Generate seeded demo hotspots for offline mode."""
     seed_val = hash(str(start_date)) % (10**8)
     rng = np.random.default_rng(seed=seed_val)
 
@@ -216,12 +218,87 @@ def _demo_hotspots(
 
     return hotspots[:n]
 
+
+# CACHING DECORATORS (KEY FIX FOR SPEED!)
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_hotspots_cached(lon_min, lon_max, lat_min, lat_max, start, end, fdi_t):
+    """Cached hotspot loading - won't rerun unless params change."""
+    return get_cloud_reduced_hotspots(
+        lon_range=[lon_min, lon_max],
+        lat_range=[lat_min, lat_max],
+        start_date=start,
+        end_date=end,
+        fdi_threshold=fdi_t,
+        ndvi_threshold=0.15
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_stats_cached(start, end):
+    """Cached stats loading."""
+    try:
+        return get_region_stats(
+            aoi=ee.Geometry.Rectangle([66, 12, 72, 18]),
+            start=start,
+            end=end
+        )
+    except:
+        return {"mean_fdi": 0.065, "mean_pi": 0.052}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_tile_cached(start, end):
+    """Cached tile loading."""
+    try:
+        return get_plastic_tile_url(
+            aoi=ee.Geometry.Rectangle([66, 12, 72, 18]),
+            start=start,
+            end=end
+        )
+    except:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _plan_route_cached(hs_json, speed):
+    """Cached routing - recalculates if hotspots or speed change."""
+    hs = json.loads(hs_json)
+
+    if not hs:
+        return {
+            "waypoints": [],
+            "segments": [],
+            "total_cost": 0.0,
+            "total_dist_km": 0.0,
+            "land_detours": 0
+        }
+
+    return plan_cleanup_route(
+        hs,
+        ship_speed=speed
+    )
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _generate_mission_report_cached(hotspots_json, route_json, region_stats_json, source):
+    """Cached wrapper to prevent re-running Gemini on every UI interaction."""
+    hotspots = json.loads(hotspots_json)
+    route = json.loads(route_json)
+    region_stats = json.loads(region_stats_json)
+    agent = SupervisorAgent()
+    return agent.generate_mission_report(
+        hotspots=hotspots,
+        route=route,
+        region_stats=region_stats,
+        source=source
+    )
+
 # ─────────────────────────────────────────────────────────────
-# LOAD HOTSPOTS AND STATS
+# LOAD DATA (ONLY WHEN BUTTON CLICKED)
 # ─────────────────────────────────────────────────────────────
 if "hotspots" not in st.session_state or run_btn:
 
-    with st.spinner("🛰️ Querying satellite systems..."):
+    with st.spinner("🛰️  Querying satellite systems..."):
 
         hotspots = None
         region_stats = None
@@ -230,32 +307,15 @@ if "hotspots" not in st.session_state or run_btn:
 
         if _GEE_AVAILABLE:
             try:
-                # STEP 1 FIX: get_cloud_reduced_hotspots now returns real FDI/PI
-                hotspots = get_cloud_reduced_hotspots(
-                    lon_range=[60.0, 80.0],
-                    lat_range=[5.0, 30.0],
-                    start_date=start_str,
-                    end_date=end_str,
-                    fdi_threshold=fdi_thresh,
-                    ndvi_threshold=0.15
+                # Use CACHED loading (10x faster on reruns!)
+                hotspots = _load_hotspots_cached(
+                    64.0, 74.0, 8.0, 22.0,
+                    start_str, end_str, fdi_thresh
                 )
 
-                # Get region statistics
-                try:
-                    region_stats = get_region_stats(
-                        aoi=ee.Geometry.Rectangle([60, 5, 80, 30]),
-                        start=start_str,
-                        end=end_str
-                    )
-                except:
-                    region_stats = {"mean_fdi": 0.065, "mean_pi": 0.052}
+                region_stats = _load_stats_cached(start_str, end_str)
 
-                # Get satellite tile overlay
-                tile_info = get_plastic_tile_url(
-                    aoi=ee.Geometry.Rectangle([60, 5, 80, 30]),
-                    start=start_str,
-                    end=end_str
-                )
+                tile_info = _load_tile_cached(start_str, end_str)
 
                 data_source = "live"
 
@@ -277,7 +337,7 @@ if "hotspots" not in st.session_state or run_btn:
                 st.session_state["data_source"] = data_source
 
         else:
-            hotspots = _demo_hotspots(max_hotspots, fdi_thresh, start_str)
+            hotspots = _demo_hotspots(10, fdi_thresh, start_str)
             region_stats = {"mean_fdi": 0.065, "mean_pi": 0.052}
             tile_info = None
             data_source = "demo"
@@ -287,92 +347,26 @@ if "hotspots" not in st.session_state or run_btn:
             st.session_state["tile_info"] = tile_info
             st.session_state["data_source"] = data_source
 
-# ─────────────────────────────────────────────────────────────
-# STATE
-# ─────────────────────────────────────────────────────────────
+# STATE RETRIEVAL
 hotspots = st.session_state.get("hotspots", [])
 region_stats = st.session_state.get("region_stats", {})
 tile_info = st.session_state.get("tile_info")
 data_source = st.session_state.get("data_source", "demo")
 
-# ─────────────────────────────────────────────────────────────
-# ROUTING
-# ─────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────
-# PERFORMANCE LIMITER + ROUTING
-# ─────────────────────────────────────────────────────────────
+# ROUTING (CACHED)
+route = _plan_route_cached(
+    json.dumps(hotspots),
+    ship_speed
+)
 
-# Hard cap to prevent 2-opt explosion
-if len(hotspots) > 10:
-    hotspots = hotspots[:10]
-
-@st.cache_data(ttl=600)
-def _plan_route(hs_json, speed):
-
-    hs = json.loads(hs_json)
-
-    # Emergency limiter
-    hs = hs[:10]
-
-    # Empty safety
-    if not hs:
-        return {
-            "waypoints": [],
-            "segments": [],
-            "total_cost": 0.0,
-            "total_dist_km": 0.0,
-            "land_detours": 0
-        }
-
-    # Small hotspot count → fast routing
-    if len(hs) <= 2:
-        return {
-            "waypoints": hs,
-            "segments": [],
-            "total_cost": 0.0,
-            "total_dist_km": 0.0,
-            "land_detours": 0
-        }
-
-    try:
-        return plan_cleanup_route(
-            hs,
-            ship_speed=speed
-        )
-
-    except Exception as e:
-        logger.error(f"Routing failed: {e}")
-
-        return {
-            "waypoints": hs,
-            "segments": [],
-            "total_cost": 0.0,
-            "total_dist_km": 0.0,
-            "land_detours": 0
-        }
-
-
-# Spinner so user sees progress
-with st.spinner("Computing marine route..."):
-
-    route = _plan_route(
-        json.dumps(hotspots),
-        ship_speed
-    )
-
-# ─────────────────────────────────────────────────────────────
-# STEP 3: AI SUPERVISOR AGENT (INTEGRATED)
-# ─────────────────────────────────────────────────────────────
-agent = SupervisorAgent()
-
-# Call agent with real data from pipeline (STEP 3 FIX)
+# STEP 3: AI SUPERVISOR AGENT
 mission_summary = None
 try:
-    mission_summary = agent.generate_mission_report(
-        hotspots=hotspots,
-        route=route,
-        region_stats=region_stats,
-        source=data_source
+    mission_summary = _generate_mission_report_cached(
+        json.dumps(hotspots),
+        json.dumps(route),
+        json.dumps(region_stats),
+        data_source
     )
 except Exception as e:
     logger.warning(f"Agent generation failed: {e}")
@@ -398,9 +392,7 @@ if not mission_summary:
 ✓ Automated mission brief generated
 """
 
-# ─────────────────────────────────────────────────────────────
-# METRICS
-# ─────────────────────────────────────────────────────────────
+
 k1, k2, k3, k4 = st.columns(4)
 
 with k1:
@@ -416,7 +408,7 @@ with k4:
     st.metric("Data Source", data_source.upper())
 
 # ─────────────────────────────────────────────────────────────
-# STEP 3: AI SUMMARY PANEL (INTEGRATED)
+# STEP 3: AI SUMMARY PANEL
 # ─────────────────────────────────────────────────────────────
 st.markdown("---")
 
@@ -426,7 +418,7 @@ with st.expander("🧠 Supervisor AI Assessment", expanded=True):
 # ─────────────────────────────────────────────────────────────
 # MAP
 # ─────────────────────────────────────────────────────────────
-st.markdown("### 🗺️ Live Marine Debris Map")
+st.markdown("### 🗺️  Live Marine Debris Map")
 
 m = folium.Map(
     location=[17.5, 70.0],
@@ -487,7 +479,12 @@ if show_route and route["waypoints"]:
         ).add_to(m)
 
 folium.LayerControl().add_to(m)
-folium_static(m, width=1200, height=600)
+
+folium_static(
+    m,
+    width="100%",
+    height=600
+)
 
 # ─────────────────────────────────────────────────────────────
 # TABLES
@@ -507,11 +504,11 @@ with col_left:
                 "FDI": w["fdi"],
                 "Dist to next (km)": (
                     route["segments"][i]["dist_km"]
-                    if i < len(route["segments"]) else "–"
+                    if i < len(route["segments"]) else None
                 ),
                 "Time (h)": (
                     route["segments"][i]["cost"]
-                    if i < len(route["segments"]) else "–"
+                    if i < len(route["segments"]) else None
                 ),
             }
             for i, w in enumerate(route["waypoints"])
@@ -533,8 +530,11 @@ with col_right:
         st.metric("Land Detours", route.get("land_detours", 0))
         st.metric("Total Legs", len(route["segments"]))
 
+# ─────────────────────────────────────────────────────────────
 # FOOTER
+# ─────────────────────────────────────────────────────────────
 st.markdown("---")
+
 st.caption(
     "AetherSea-II · Sentinel-2 · Google Earth Engine · NOAA OSCAR · Gemini AI"
 )
