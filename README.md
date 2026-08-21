@@ -37,18 +37,30 @@ flowchart TD
 
 We leveraged multi-band optical rasters from the European Space Agency (ESA) Sentinel-2 satellite constellation at 10-meter ground resolution. To detect sub-pixel floating polymer aggregates over open seawater, we implemented the Floating Debris Index ($\text{FDI}$):
 
-$$\text{FDI} = R_{\text{NIR}} - \left[ R_{\text{RED}} + (R_{\text{SWIR1}} - R_{\text{RED}}) \times \frac{\lambda_{\text{NIR}} - \lambda_{\text{RED}}}{\lambda_{\text{SWIR1}} - \lambda_{\text{RED}}} \times 10 \right]$$
+$$
+FDI = R_{NIR} - [R_{RED} + (R_{SWIR1}-R_{RED})
+\frac{\lambda_{NIR}-\lambda_{RED}}
+{\lambda_{SWIR1}-\lambda_{RED}}]
+$$
 
 Where:
-- $R_{\text{RED}}$ is Band 4 reflectance ($\lambda_{\text{RED}} = 665\text{ nm}$)
-- $R_{\text{NIR}}$ is Band 8 reflectance ($\lambda_{\text{NIR}} = 842\text{ nm}$)
-- $R_{\text{SWIR1}}$ is Band 11 reflectance ($\lambda_{\text{SWIR1}} = 1610\text{ nm}$)
+
+- $R_{RED}$ is Band 4 reflectance ($\lambda_{RED}=665\,nm$)
+- $R_{NIR}$ is Band 8 reflectance ($\lambda_{NIR}=842\,nm$)
+- $R_{SWIR1}$ is Band 11 reflectance ($\lambda_{SWIR1}=1610\,nm$)
 
 ### 2. Spatial Clustering & Convex Hull Delineation
 
 Detected high-confidence debris pixels are grouped using Density-Based Spatial Clustering of Applications with Noise ($\text{DBSCAN}$) with parameter bounds $\varepsilon = 0.04^\circ$ and $\text{MinPts} = 4$. For every discovered cluster $C_k$, the spatial boundary is calculated via geometric Convex Hulls:
 
-$$\text{Hull}(C_k) = \left\{ \sum_{i=1}^{|C_k|} \alpha_i x_i \;\middle|\; \alpha_i \ge 0, \sum_{i=1}^{|C_k|} \alpha_i = 1 \right\}$$
+$$
+Hull(C_k)=
+\{
+\sum_{i=1}^{|C_k|}\alpha_i x_i :
+\alpha_i \geq 0,
+\sum_{i=1}^{|C_k|}\alpha_i = 1
+\}
+$$
 
 ### 3. Lagrangian Hydrodynamic Drift Advection
 
