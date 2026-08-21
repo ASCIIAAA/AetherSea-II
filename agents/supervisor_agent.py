@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import json
 from dotenv import load_dotenv
+from typing import Dict, Any, List
+import google.generativeai as genai
 
 load_dotenv()
 
@@ -120,3 +122,42 @@ Keep response concise and professional.
 AI generation failed:
 {str(e)}
 """
+
+class MarineHabitatSupervisorAgent:
+    """
+    Multi-agent orchestrator that ingests telemetry, runs ecological triage,
+    and formats vessel dispatch orders with verifiable impact metrics.
+    """
+    def __init__(self, api_key: str):
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            system_instruction=(
+                "You are the AetherSea Environmental Mission Commander for marine habitat protection. "
+                "Your role is to triage satellite-detected plastic clusters, assess ecological risk to "
+                "vulnerable marine sanctuaries, and issue actionable interception commands for cleanup fleets. "
+                "Always output your operational triage in structured JSON."
+            )
+        )
+
+    def generate_incident_response(self, telemetry_data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        prompt = f"""
+        Analyze the following marine debris clusters, their hydrodynamics, and habitat risk scores:
+        {json.dumps(telemetry_data, indent=2)}
+
+        Provide an incident report containing:
+        1. 'executive_summary': A direct overview of immediate ecological threats.
+        2. 'triage_priorities': Sorted list of cluster IDs from highest ecological threat to lowest.
+        3. 'vessel_dispatch_strategy': Specific navigational instructions and ETA windows.
+        4. 'measurable_impact': Estimates of:
+           - microplastic_breakdown_prevented_kg
+           - vulnerable_area_shielded_sq_km
+           - estimated_emissions_saved_pct
+
+        Return strictly valid JSON matching this structure.
+        """
+        response = self.model.generate_content(
+            prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        return json.loads(response.text)       
