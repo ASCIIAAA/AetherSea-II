@@ -95,7 +95,7 @@ This allows identification of anomalous spectral signatures associated with floa
 
 ---
 
-# 2. Spatial Clustering & Convex Hull Delineation
+## 2. Spatial Clustering & Convex Hull Delineation
 
 Detected debris pixels are grouped using:
 
@@ -125,7 +125,7 @@ This converts scattered debris detections into meaningful spatial clusters.
 
 ---
 
-# 3. Lagrangian Hydrodynamic Drift Prediction
+## 3. Lagrangian Hydrodynamic Drift Prediction
 
 Floating debris movement is influenced by ocean currents.
 
@@ -167,7 +167,7 @@ time windows.
 
 ---
 
-# 4. Habitat Threat Scoring (HTS)
+## 4. Habitat Threat Scoring (HTS)
 
 Not all debris poses the same ecological risk.
 
@@ -202,7 +202,7 @@ This enables intelligent prioritization of cleanup operations.
 
 ---
 
-# 5. Autonomous Fleet Route Optimization
+## 5. Autonomous Fleet Route Optimization
 
 To dispatch Autonomous Surface Vessels (ASVs), AetherSea implements a grid-based A* search algorithm.
 
@@ -320,6 +320,12 @@ Features:
 ✅ Automated mission synthesis  
 ✅ Structured JSON mission generation  
 
+Take a look:
+<img width="1866" height="1042" alt="image" src="https://github.com/user-attachments/assets/86398021-b550-47a3-9f2c-1e144d7a8dd8" />
+
+<img width="1866" height="1042" alt="image" src="https://github.com/user-attachments/assets/990ee022-5201-461a-82a8-0a8cc7cd39fc" />
+
+
 
 # Challenges Solved
 
@@ -386,7 +392,6 @@ Created the Habitat Threat Score (HTS) framework.
 ---
 
 # Datasets & Attribution
-
 
 ## Sentinel-2 MSI
 
